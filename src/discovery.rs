@@ -22,6 +22,14 @@ impl MdnsDiscovery {
 	/// Start advertising. Errors are logged and otherwise ignored, as discovery is
 	/// not critical: clients can still add the host manually.
 	pub fn spawn(address: &str, port: u16, name: &str) -> Self {
+		// Throwaway Hosts (moonlight-ios LatencyHost) must not be discovered by other clients.
+		if std::env::var_os("MOONSHINE_NO_MDNS").is_some() {
+			tracing::info!("MOONSHINE_NO_MDNS is set: not advertising over mDNS.");
+			return Self {
+				daemon: None,
+				fullname: String::new(),
+			};
+		}
 		match register(address, port, name) {
 			Ok((daemon, fullname)) => Self {
 				daemon: Some(daemon),

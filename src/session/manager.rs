@@ -84,6 +84,9 @@ struct SessionManagerInner {
 	video_stream_context: Option<VideoStreamContext>,
 	audio_stream_context: Option<AudioStreamContext>,
 
+	/// Whether the ANNOUNCE negotiated the latency protocol, consumed by `start_session`.
+	latency_protocol: bool,
+
 	/// Broadcast sender for per-frame encoding statistics.
 	stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
 
@@ -119,6 +122,7 @@ impl SessionManagerInner {
 		self.keys_tx = None;
 		self.video_stream_context = None;
 		self.audio_stream_context = None;
+		self.latency_protocol = false;
 		self.video_start = None;
 		self.audio_start = None;
 		self.stop = ShutdownManager::new();
@@ -177,6 +181,7 @@ impl SessionManager {
 			keys_tx: None,
 			video_stream_context: None,
 			audio_stream_context: None,
+			latency_protocol: false,
 			stats_tx: tokio::sync::broadcast::channel(256).0,
 			stop_watcher: None,
 			video_start: None,
@@ -212,11 +217,13 @@ impl SessionManager {
 		}
 	}
 
-	/// Set the video and audio stream contexts after receiving RTSP ANNOUNCE.
+	/// Set the video and audio stream contexts after receiving RTSP ANNOUNCE, and whether it
+	/// negotiated the latency protocol.
 	pub async fn set_stream_context(
 		&self,
 		video_stream_context: VideoStreamContext,
 		audio_stream_context: AudioStreamContext,
+		latency_protocol: bool,
 	) -> Result<(), ()> {
 		let mut guard = self.inner.lock().await;
 		match guard.session.as_ref() {
@@ -224,6 +231,7 @@ impl SessionManager {
 				tracing::debug!("Stream contexts received via RTSP ANNOUNCE.");
 				guard.video_stream_context = Some(video_stream_context);
 				guard.audio_stream_context = Some(audio_stream_context);
+				guard.latency_protocol = latency_protocol;
 				Ok(())
 			},
 			Some(SessionState::Initialized(_)) => {
@@ -346,14 +354,19 @@ impl SessionManager {
 	/// Returns `Ok(())` only after all three streams (video, audio, control) are
 	/// successfully constructed. Returns `Err(())` if any stream fails to initialize.
 	pub async fn start_session(&self) -> Result<(), ()> {
-		let (launched, video_stream_context, audio_stream_context, stop) = {
+		let (launched, video_stream_context, audio_stream_context, latency_protocol, stop) = {
 			let mut guard = self.inner.lock().await;
 			let video_stream_context = guard.video_stream_context.take();
 			let audio_stream_context = guard.audio_stream_context.take();
+			let latency_protocol = std::mem::take(&mut guard.latency_protocol);
 			match guard.session.take() {
-				Some(SessionState::Launched(launched)) => {
-					(launched, video_stream_context, audio_stream_context, guard.stop.clone())
-				},
+				Some(SessionState::Launched(launched)) => (
+					launched,
+					video_stream_context,
+					audio_stream_context,
+					latency_protocol,
+					guard.stop.clone(),
+				),
 				Some(SessionState::Initialized(session)) => {
 					guard.session = Some(SessionState::Initialized(session));
 					tracing::warn!("StartSession rejected: session not yet launched");
@@ -398,6 +411,7 @@ impl SessionManager {
 				stream_timeout,
 				video_stream_context,
 				audio_stream_context,
+				latency_protocol,
 				stop,
 				guard.inhibit_sleep,
 			)

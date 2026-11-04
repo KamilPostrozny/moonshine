@@ -10,6 +10,7 @@ use tokio_enet::{Event, Host, HostConfig, Packet, PacketMode, PeerState};
 use self::input::gamepad::GamepadConfig;
 use self::{feedback::FeedbackCommand, input::InputHandler};
 use crate::crypto::{decrypt, encrypt};
+use crate::latency_protocol;
 use crate::session::SessionContext;
 use crate::session::SessionKeysReceiver;
 use crate::session::compositor::{
@@ -64,6 +65,7 @@ enum ControlMessageType {
 	SetMotionEvent = 0x5501,
 	SetRgbLed = 0x5502,
 	SetTriggerEffect = 0x5503,
+	LatencyMessage = latency_protocol::MESSAGE_TYPE,
 }
 
 impl TryFrom<u16> for ControlMessageType {
@@ -86,6 +88,7 @@ impl TryFrom<u16> for ControlMessageType {
 			x if x == Self::SetMotionEvent as u16 => Ok(Self::SetMotionEvent),
 			x if x == Self::SetRgbLed as u16 => Ok(Self::SetRgbLed),
 			x if x == Self::SetTriggerEffect as u16 => Ok(Self::SetTriggerEffect),
+			x if x == Self::LatencyMessage as u16 => Ok(Self::LatencyMessage),
 			_ => Err(()),
 		}
 	}
@@ -108,6 +111,7 @@ enum ControlMessage<'a> {
 	SetMotionEvent,
 	SetRgbLed,
 	SetTriggerEffect,
+	LatencyMessage(&'a [u8]), // Opaque latency protocol payload (fork extension, see `latency_protocol`).
 }
 
 impl<'a> ControlMessage<'a> {
@@ -198,6 +202,7 @@ impl<'a> ControlMessage<'a> {
 			ControlMessageType::SetMotionEvent => Ok(Self::SetMotionEvent),
 			ControlMessageType::SetRgbLed => Ok(Self::SetRgbLed),
 			ControlMessageType::SetTriggerEffect => Ok(Self::SetTriggerEffect),
+			ControlMessageType::LatencyMessage => Ok(Self::LatencyMessage(&buffer[4..])),
 		}
 	}
 }
@@ -256,11 +261,23 @@ fn encode_control(key: &[u8], sequence_number: u32, payload: &[u8]) -> Result<Ve
 	Ok(message.as_bytes())
 }
 
+/// Decrypt the payload of an encrypted control message from the client.
+fn decrypt_control(message: &EncryptedControlMessage, key: &[u8]) -> Result<Vec<u8>, aes_gcm::Error> {
+	let mut initialization_vector = [0u8; 12];
+	initialization_vector[0..4].copy_from_slice(&message.sequence_number.to_le_bytes());
+	initialization_vector[10] = b'C';
+	initialization_vector[11] = b'C';
+
+	decrypt(&message.payload, key, &initialization_vector, &message.tag)
+}
+
 /// Context passed to the control stream from Session.
 #[derive(Clone)]
 pub(crate) struct ControlStreamContext {
 	pub keys_rx: SessionKeysReceiver,
 	pub hdr: bool,
+	/// Whether the client's ANNOUNCE negotiated the latency protocol.
+	pub latency_protocol: bool,
 }
 
 impl ControlStreamContext {
@@ -270,10 +287,11 @@ impl ControlStreamContext {
 	/// `hdr_effective` may differ from `ctx.hdr` when the client requested HDR but
 	/// the GPU does not support an HDR-capable DMA-BUF format (compositor falls back
 	/// to SDR and reports `hdr = false` in `CompositorReady`).
-	pub fn new(ctx: &SessionContext, hdr_effective: bool) -> Self {
+	pub fn new(ctx: &SessionContext, hdr_effective: bool, latency_protocol: bool) -> Self {
 		Self {
 			keys_rx: ctx.keys.clone_rx().expect("session keys not initialized"),
 			hdr: hdr_effective,
+			latency_protocol,
 		}
 	}
 }
@@ -516,19 +534,9 @@ async fn run_control_loop(
 
 				// First check for encrypted control messages and decrypt them.
 				let decrypted;
+				let encrypted = matches!(control_message, ControlMessage::Encrypted(_));
 				if let ControlMessage::Encrypted(message) = control_message {
-					let mut initialization_vector = [0u8; 12];
-					initialization_vector[0..4].copy_from_slice(&message.sequence_number.to_le_bytes());
-					initialization_vector[10] = b'C';
-					initialization_vector[11] = b'C';
-
-					let keys = &*context.keys_rx.borrow();
-					let decrypted_result = decrypt(
-						&message.payload,
-						&keys.remote_input_key,
-						&initialization_vector,
-						&message.tag,
-					);
+					let decrypted_result = decrypt_control(&message, &context.keys_rx.borrow().remote_input_key);
 
 					decrypted = match decrypted_result {
 						Ok(decrypted) => decrypted,
@@ -572,6 +580,17 @@ async fn run_control_loop(
 					},
 					ControlMessage::HdrMode => {
 						tracing::info!("Received HdrMode toggle from client");
+					},
+					ControlMessage::LatencyMessage(payload) => {
+						if latency_protocol::accepts_message(context.latency_protocol, encrypted) {
+							// The payloads (clock sync, frame-clock corrections) aren't interpreted yet.
+							tracing::trace!("Received latency protocol message of {} bytes.", payload.len());
+						} else {
+							tracing::debug!(
+								"Ignoring latency protocol message (negotiated: {}, encrypted: {encrypted}).",
+								context.latency_protocol
+							);
+						}
 					},
 					skipped_message => {
 						tracing::trace!("Skipped control message: {skipped_message:?}");
@@ -635,4 +654,68 @@ async fn run_control_loop(
 	// returns. Without this, the next session's control stream may
 	// fail to bind to the same port.
 	drop(host);
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	const KEY: [u8; 16] = [7; 16];
+
+	/// A control message as moonlight-common-c frames it: type and length (little-endian), then the body.
+	fn plain(message_type: u16, body: &[u8]) -> Vec<u8> {
+		let mut buffer = Vec::new();
+		buffer.extend(message_type.to_le_bytes());
+		buffer.extend((body.len() as u16).to_le_bytes());
+		buffer.extend(body);
+		buffer
+	}
+
+	/// `plain` wrapped as the client encrypts it on the V2 control stream.
+	fn client_encrypted(sequence_number: u32, inner: &[u8]) -> Vec<u8> {
+		let mut initialization_vector = [0u8; 12];
+		initialization_vector[0..4].copy_from_slice(&sequence_number.to_le_bytes());
+		initialization_vector[10] = b'C';
+		initialization_vector[11] = b'C';
+		let mut tag = [0u8; 16];
+		let payload = encrypt(inner, &KEY, &initialization_vector, &mut tag).unwrap();
+		EncryptedControlMessage {
+			length: (4 + ENCRYPTION_TAG_LENGTH + payload.len()) as u16,
+			sequence_number,
+			tag,
+			payload,
+		}
+		.as_bytes()
+	}
+
+	#[test]
+	fn parses_a_latency_message_with_its_payload() {
+		let packet = plain(0x55f0, &[1, 2, 3]);
+		match ControlMessage::from_bytes(&packet) {
+			Ok(ControlMessage::LatencyMessage(payload)) => assert_eq!(payload, &[1, 2, 3]),
+			other => panic!("expected a latency message, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn decrypts_a_latency_message_from_the_encrypted_control_stream() {
+		let packet = client_encrypted(5, &plain(0x55f0, &[9, 8, 7, 6]));
+		let Ok(ControlMessage::Encrypted(message)) = ControlMessage::from_bytes(&packet) else {
+			panic!("expected an encrypted control message");
+		};
+		let decrypted = decrypt_control(&message, &KEY).unwrap();
+		match ControlMessage::from_bytes(&decrypted) {
+			Ok(ControlMessage::LatencyMessage(payload)) => assert_eq!(payload, &[9, 8, 7, 6]),
+			other => panic!("expected a latency message, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn rejects_a_latency_message_under_the_wrong_key() {
+		let packet = client_encrypted(5, &plain(0x55f0, &[9, 8, 7, 6]));
+		let Ok(ControlMessage::Encrypted(message)) = ControlMessage::from_bytes(&packet) else {
+			panic!("expected an encrypted control message");
+		};
+		assert!(decrypt_control(&message, &[8; 16]).is_err());
+	}
 }

@@ -11,6 +11,7 @@ use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 
 use crate::ShutdownReason;
+use crate::latency_protocol;
 use crate::session::manager::SessionManager;
 use crate::session::stream::audio::ALL_AUDIO_CONFIGS;
 use crate::session::stream::audio::AudioChannels;
@@ -113,8 +114,8 @@ impl RtspServer {
 		server
 	}
 
-	fn capabilities(&self) -> u8 {
-		ServerCapabilities::PenTouchEvents as u8 | ServerCapabilities::ControllerTouchEvents as u8
+	fn capabilities(&self) -> u32 {
+		server_feature_flags(latency_protocol::BUILT)
 	}
 
 	fn encryption_flags_supported(&self) -> u8 {
@@ -464,13 +465,19 @@ impl RtspServer {
 			encrypt_audio: client_encryption_flags & EncryptionFlags::Audio as u8 != 0,
 		};
 
+		let latency_protocol =
+			latency_protocol::negotiated(client_feature_flags(&sdp_session), latency_protocol::BUILT);
+
 		if self
 			.session_manager
-			.set_stream_context(video_stream_context, audio_stream_context)
+			.set_stream_context(video_stream_context, audio_stream_context, latency_protocol)
 			.await
 			.is_err()
 		{
 			return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::InternalServerError);
+		}
+		if latency_protocol {
+			tracing::info!("Latency protocol negotiated.");
 		}
 
 		rtsp_types::Response::builder(request.version(), rtsp_types::StatusCode::Ok)
@@ -604,6 +611,20 @@ fn rtsp_response(
 		.build(Vec::new())
 }
 
+/// Feature flags for `x-ss-general.featureFlags` in the DESCRIBE reply.
+///
+/// DESCRIBE goes out before the client's ANNOUNCE, so the latency protocol bit is a capability
+/// every client sees; a session speaks it only once the client offers it (see `latency_protocol`).
+fn server_feature_flags(latency_protocol_built: bool) -> u32 {
+	let flags = ServerCapabilities::PenTouchEvents as u32 | ServerCapabilities::ControllerTouchEvents as u32;
+	latency_protocol::advertise(flags, latency_protocol_built)
+}
+
+/// The client's `x-ml-general.featureFlags` from its ANNOUNCE, if it sent any.
+fn client_feature_flags(sdp_session: &sdp_types::Session) -> Option<u32> {
+	get_optional_sdp_attribute(sdp_session, "x-ml-general.featureFlags")
+}
+
 fn get_optional_sdp_attribute<F: FromStr>(sdp_session: &sdp_types::Session, attribute: &str) -> Option<F> {
 	sdp_session
 		.get_first_attribute_value(attribute)
@@ -621,4 +642,41 @@ fn get_sdp_attribute<F: FromStr>(sdp_session: &sdp_types::Session, attribute: &s
 		.trim()
 		.parse()
 		.map_err(|_| tracing::warn!("Attribute {attribute} can't be parsed."))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// The SDP preamble moonlight-common-c sends, with the given attribute lines.
+	fn announce(attributes: &str) -> sdp_types::Session {
+		let body = format!(
+			"v=0\r\no=android 0 14 IN IPv4 10.42.0.71\r\ns=NVIDIA Streaming Client\r\n{attributes}t=0 0\r\nm=video 47998  \r\n"
+		);
+		sdp_types::Session::parse(body.as_bytes()).expect("valid SDP")
+	}
+
+	#[test]
+	fn describe_advertises_the_latency_protocol_only_when_built() {
+		assert_eq!(server_feature_flags(true), 0x4000_0003);
+		assert_eq!(server_feature_flags(false), 0x03);
+	}
+
+	#[test]
+	fn announce_offering_the_latency_protocol_negotiates_it() {
+		let offered = announce("a=x-ml-general.featureFlags:1073741827 \r\n");
+		assert_eq!(client_feature_flags(&offered), Some(0x4000_0003));
+		assert!(latency_protocol::negotiated(client_feature_flags(&offered), true));
+		assert!(!latency_protocol::negotiated(client_feature_flags(&offered), false));
+	}
+
+	#[test]
+	fn announce_without_the_offer_does_not_negotiate() {
+		let stock = announce("a=x-ml-general.featureFlags:3 \r\n");
+		assert!(!latency_protocol::negotiated(client_feature_flags(&stock), true));
+
+		let no_flags = announce("");
+		assert_eq!(client_feature_flags(&no_flags), None);
+		assert!(!latency_protocol::negotiated(client_feature_flags(&no_flags), true));
+	}
 }

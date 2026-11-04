@@ -649,7 +649,8 @@ async fn run_benchmark(
 	};
 
 	tracing::info!("Setting stream contexts...");
-	if let Err(err) = session_manager.set_stream_context(video_ctx, audio_ctx).await {
+	// The bench has no client, so nothing negotiates the latency protocol.
+	if let Err(err) = session_manager.set_stream_context(video_ctx, audio_ctx, false).await {
 		let _ = session_manager.stop_session().await;
 		return Err(boxed_error(format!("Failed to set stream context: {err:?}")));
 	}

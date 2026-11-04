@@ -249,12 +249,14 @@ impl LaunchedSession {
 		&self.context
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	pub(crate) async fn start(
 		self,
 		video_config: VideoStreamConfig,
 		stream_timeout: u64,
 		video_ctx: VideoStreamContext,
 		audio_ctx: AudioStreamContext,
+		latency_protocol: bool,
 		stop: ShutdownManager<SessionShutdownReason>,
 		inhibit_sleep: bool,
 	) -> Result<(ActiveSession, StartSignal, StartSignal), ()> {
@@ -296,7 +298,7 @@ impl LaunchedSession {
 		let video_handle_for_resume = video_handle.clone();
 
 		// Start control stream — receives both handles.
-		let control_ctx = ControlStreamContext::new(&context, hdr_effective);
+		let control_ctx = ControlStreamContext::new(&context, hdr_effective, latency_protocol);
 		control_stream.start(
 			stream_timeout,
 			control_ctx,

@@ -11,10 +11,12 @@ version.workspace = true
 edition = "2024"
 
 [features]
-default = ["cli"]
+default = ["cli", "latency-protocol"]
 # The `moonshine` binary: command line and logging. Library users (such as
 # moonshine-tools) set `default-features = false` to skip its dependencies.
 cli = ["dep:clap", "dep:tracing-subscriber"]
+# Advertise and negotiate moonlight-ios' latency protocol (fork extension, `src/latency_protocol.rs`).
+latency-protocol = []
 
 [[bin]]
 name = "moonshine"

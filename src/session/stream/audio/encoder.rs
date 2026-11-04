@@ -70,7 +70,10 @@ impl AudioEncoder {
 		let fec_encoder = ReedSolomon::new(NR_DATA_SHARDS, NR_PARITY_SHARDS)
 			.map_err(|e| tracing::warn!("Failed to create FEC encoder: {e}"))?;
 
-		let inner = AudioEncoderInner {};
+		let inner = AudioEncoderInner {
+			channels: stream_config.channels as usize,
+			sample_rate,
+		};
 		std::thread::Builder::new()
 			.name("audio-encode".to_string())
 			.spawn(move || {
@@ -92,7 +95,10 @@ impl AudioEncoder {
 	}
 }
 
-struct AudioEncoderInner {}
+struct AudioEncoderInner {
+	channels: usize,
+	sample_rate: u32,
+}
 
 impl AudioEncoderInner {
 	#[allow(clippy::too_many_arguments)]
@@ -123,7 +129,6 @@ impl AudioEncoderInner {
 		}
 
 		let mut sequence_number = 0u16;
-		let stream_start_time = std::time::Instant::now();
 
 		// For unknown reasons, the RS parity matrix computed by our RS implementation.
 		// doesn't match the one Nvidia uses for audio data. I'm not exactly sure why,
@@ -164,8 +169,12 @@ impl AudioEncoderInner {
 				},
 			};
 
-			// TODO: Figure out the 1000 / 90 value.
-			let timestamp = ((std::time::Instant::now() - stream_start_time).as_micros() / (1000 / 90)) as u32;
+			// Moonlight's audio FEC queue synthesises a block's base timestamp from a data
+			// packet as `timestamp - (sequence - base) * packet duration (ms)`, as Sunshine
+			// stamps it, and checks it against the parity packets' header (an assert in
+			// debug builds of moonlight-common-c). So stamp packets in milliseconds of audio.
+			let packet_ms = (frame.buf.len() / self.channels.max(1)) as u32 * 1000 / self.sample_rate;
+			let timestamp = (sequence_number as u32).wrapping_mul(packet_ms);
 			let encoded_size = match encoder.encode_float(&frame.buf, &mut encoded_audio) {
 				Ok(encoded_size) => encoded_size,
 				Err(e) => {

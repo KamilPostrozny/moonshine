@@ -38,7 +38,9 @@ crossbeam-channel = "0.5.15"
 dasp_sample = "0.11.0"
 dirs = "6.0.0"
 fec-rs = { version = "0.1.0", features = ["parallel"] }
-ferriscope = { git = "https://github.com/hgaiser/ferriscope", rev = "e4dcc887bf8b88142c504b53938467968cf21964", default-features = false }
+# The KamilPostrozny fork's `latency` branch: upstream plus the embedder-steered frame clock
+# (`CompositorHandles::frame_clock`) the latency protocol's corrections drive.
+ferriscope = { git = "https://github.com/KamilPostrozny/ferriscope", rev = "c3e1c068101591647a73479ec24b28726c57128a", default-features = false }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 gethostname = "1.1.0"
 hex = "0.4.3"

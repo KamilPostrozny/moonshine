@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — latency fork
+
+### Added
+
+- Apply negotiated type-3 relative frame-clock corrections to the session's ferriscope compositor. Pin ferriscope to `KamilPostrozny/ferriscope` at `c3e1c06`: period within 1% of nominal, phase shift at most half a period per message and pending in total, slewed at most 250 µs per frame. After one second without corrections, ferriscope returns to nominal.
+- Send the type-4 steerable report after the client's first clock-sync request, and again when the compositor installs a correction. The acknowledgement is the sequence installed by the compositor thread, not merely queued by the control stream. All Moonshine Streams capture ferriscope's session, whose tick paces native Wayland and Xwayland clients, including Steam.
+
 ## [v0.16.1] - 13-09-2026
 
 ### Added

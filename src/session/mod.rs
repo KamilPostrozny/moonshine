@@ -166,7 +166,13 @@ impl InitializedSession {
 			stats_tx,
 		)
 		.await?;
-		let control_stream = ControlStream::new(control_config, address, handles.input, stop.clone())?;
+		let control_stream = ControlStream::new(
+			control_config,
+			address,
+			handles.input,
+			handles.frame_clock,
+			stop.clone(),
+		)?;
 
 		Ok(Self {
 			context,

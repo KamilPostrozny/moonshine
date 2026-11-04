@@ -9,6 +9,7 @@
 //! `CompositorHandles` whose endpoints are filled in by `Compositor::launch`.
 
 pub(crate) mod frame;
+pub(crate) mod frame_clock;
 pub(crate) mod input;
 
 use std::sync::{Arc, OnceLock};
@@ -21,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::session::SessionContext;
 use crate::session::manager::SessionShutdownReason;
 
+use self::frame_clock::CompositorFrameClock;
 use self::input::CompositorInput;
 
 /// How long [`Compositor::launch`] waits for ferriscope's readiness handshake.
@@ -132,6 +134,7 @@ pub(crate) type CompositorFrames = Arc<OnceLock<FrameReceiver>>;
 pub(crate) struct CompositorHandles {
 	pub frames: CompositorFrames,
 	pub input: CompositorInput,
+	pub frame_clock: CompositorFrameClock,
 }
 
 /// Unlaunched compositor — holds the handles' endpoints, can only be launched.
@@ -209,10 +212,12 @@ impl Compositor {
 		let handles = CompositorHandles {
 			frames: CompositorFrames::default(),
 			input: CompositorInput::new(context.width, context.height),
+			frame_clock: CompositorFrameClock::default(),
 		};
 		let ours = CompositorHandles {
 			frames: Arc::clone(&handles.frames),
 			input: handles.input.clone(),
+			frame_clock: handles.frame_clock.clone(),
 		};
 		(
 			Self {
@@ -268,6 +273,7 @@ impl Compositor {
 			return Err(());
 		}
 		handles.input.connect(ferriscope_handles.input);
+		handles.frame_clock.connect(ferriscope_handles.frame_clock);
 
 		// `LaunchedCompositor` is a short-lived "ready" handle in Moonshine: it
 		// is dropped once the display names have been read, so it must not own

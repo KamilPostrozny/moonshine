@@ -299,6 +299,7 @@ impl ControlStreamContext {
 pub(crate) struct ControlStream {
 	stop: ShutdownManager<SessionShutdownReason>,
 	input_handler: InputHandler,
+	frame_clock: crate::session::compositor::frame_clock::CompositorFrameClock,
 	host: Host,
 }
 
@@ -307,6 +308,7 @@ impl ControlStream {
 		config: ControlStreamConfig,
 		address: String,
 		compositor_input: CompositorInput,
+		frame_clock: crate::session::compositor::frame_clock::CompositorFrameClock,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) -> Result<Self, ()> {
 		let input_handler = InputHandler::new(compositor_input, stop_session_manager.clone(), config.gamepad.clone())?;
@@ -332,6 +334,7 @@ impl ControlStream {
 		Ok(Self {
 			stop: stop_session_manager,
 			input_handler,
+			frame_clock,
 			host,
 		})
 	}
@@ -347,6 +350,7 @@ impl ControlStream {
 		let Self {
 			stop: stop_session_manager,
 			input_handler,
+			frame_clock,
 			host,
 		} = self;
 
@@ -358,6 +362,7 @@ impl ControlStream {
 				audio_trigger,
 				context,
 				input_handler,
+				frame_clock,
 				stop_session_manager,
 				hdr_metadata_rx,
 			)
@@ -492,6 +497,7 @@ async fn run_control_loop(
 	audio_trigger: StartSignal,
 	context: ControlStreamContext,
 	input_handler: InputHandler,
+	frame_clock: crate::session::compositor::frame_clock::CompositorFrameClock,
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	mut hdr_metadata_rx: watch::Receiver<HdrModeState>,
 ) {
@@ -512,6 +518,8 @@ async fn run_control_loop(
 	let mut connected_peer: Option<tokio_enet::PeerId> = None;
 	// Whether the connected client has the capture epoch of the video RTP timestamps.
 	let mut capture_epoch_sent = false;
+	let mut latency_client_ready = false;
+	let mut last_clock_report = None;
 
 	while !stop_session_manager.is_shutdown_triggered() {
 		// A clock-sync request this iteration received, with its host receive time, answered
@@ -546,6 +554,8 @@ async fn run_control_loop(
 			Ok(Some(Event::Connect { peer_id, .. })) => {
 				connected_peer = Some(peer_id);
 				capture_epoch_sent = false;
+				latency_client_ready = false;
+				last_clock_report = None;
 			},
 			Ok(Some(Event::Disconnect { peer_id, .. })) => {
 				if connected_peer == Some(peer_id) {
@@ -620,8 +630,11 @@ async fn run_control_loop(
 							match latency_protocol::Message::decode(payload) {
 								Some(request @ latency_protocol::Message::ClockSyncRequest { .. }) => {
 									clock_sync_request = Some((request, latency_protocol::monotonic_ns(received_at)));
+									latency_client_ready = true;
 								},
-								// Frame-clock corrections aren't applied yet.
+								Some(correction @ latency_protocol::Message::Correction { .. }) => {
+									frame_clock.apply(correction);
+								},
 								Some(message) => tracing::trace!("Received latency protocol message: {message:?}"),
 								None => tracing::debug!(
 									"Ignoring latency protocol message of {} bytes: unknown version or type.",
@@ -669,6 +682,19 @@ async fn run_control_loop(
 			send_latency_message(&mut host, peer_id, &key, &mut sequence_number, &message);
 			capture_epoch_sent = true;
 			tracing::info!("Latency protocol: announced the capture epoch ({epoch_ns} ns, {RTP_CLOCK_RATE} Hz).");
+		}
+
+		// Wait until the client listens, then report this Stream's clock and
+		// acknowledge only corrections actually installed by the compositor thread.
+		let report = frame_clock.report();
+		if latency_client_ready
+			&& last_clock_report != Some(report)
+			&& let Some(peer_id) = connected_peer
+		{
+			let key = context.keys_rx.borrow().remote_input_key.clone();
+			send_latency_message(&mut host, peer_id, &key, &mut sequence_number, &report);
+			tracing::info!("Latency protocol: frame clock {report:?}");
+			last_clock_report = Some(report);
 		}
 
 		// Send HDR mode notification after the host.service() match to avoid double mutable borrow.

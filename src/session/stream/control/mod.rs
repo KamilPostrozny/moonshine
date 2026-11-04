@@ -19,7 +19,7 @@ use crate::session::compositor::{
 };
 use crate::session::manager::SessionShutdownReason;
 use crate::session::stream::StartSignal;
-use crate::session::stream::video::VideoStreamHandle;
+use crate::session::stream::video::{RTP_CLOCK_RATE, VideoStreamHandle};
 
 mod feedback;
 pub(crate) mod input;
@@ -464,6 +464,26 @@ fn send_hdr_state(
 	tracing::debug!("Sent HDR mode ({label}) to client: enabled={}", state.enabled);
 }
 
+/// Send a latency protocol message to the client, then advance `sequence_number`.
+fn send_latency_message(
+	host: &mut Host,
+	peer_id: tokio_enet::PeerId,
+	key: &[u8],
+	sequence_number: &mut u32,
+	message: &latency_protocol::Message,
+) {
+	let payload = latency_protocol::control_message(message);
+	send_to_peer(
+		host,
+		peer_id,
+		key,
+		*sequence_number,
+		&payload,
+		"latency protocol message",
+	);
+	*sequence_number += 1;
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_control_loop(
 	stream_timeout: u64,
@@ -490,8 +510,14 @@ async fn run_control_loop(
 	let mut audio_triggered = false;
 	// Track which peer slot the client is connected to.
 	let mut connected_peer: Option<tokio_enet::PeerId> = None;
+	// Whether the connected client has the capture epoch of the video RTP timestamps.
+	let mut capture_epoch_sent = false;
 
 	while !stop_session_manager.is_shutdown_triggered() {
+		// A clock-sync request this iteration received, with its host receive time, answered
+		// after the `host.service()` match.
+		let mut clock_sync_request = None;
+
 		// Check if the timeout has passed.
 		if std::time::Instant::now() > stop_deadline {
 			tracing::info!(
@@ -519,6 +545,7 @@ async fn run_control_loop(
 		{
 			Ok(Some(Event::Connect { peer_id, .. })) => {
 				connected_peer = Some(peer_id);
+				capture_epoch_sent = false;
 			},
 			Ok(Some(Event::Disconnect { peer_id, .. })) => {
 				if connected_peer == Some(peer_id) {
@@ -526,6 +553,8 @@ async fn run_control_loop(
 				}
 			},
 			Ok(Some(Event::Receive { ref packet, .. })) => {
+				// Before decrypting: a clock-sync request's host receive time.
+				let received_at = std::time::Instant::now();
 				let mut control_message = match ControlMessage::from_bytes(packet.data()) {
 					Ok(control_message) => control_message,
 					Err(()) => break,
@@ -582,14 +611,23 @@ async fn run_control_loop(
 						tracing::info!("Received HdrMode toggle from client");
 					},
 					ControlMessage::LatencyMessage(payload) => {
-						if latency_protocol::accepts_message(context.latency_protocol, encrypted) {
-							// The payloads (clock sync, frame-clock corrections) aren't interpreted yet.
-							tracing::trace!("Received latency protocol message of {} bytes.", payload.len());
-						} else {
+						if !latency_protocol::accepts_message(context.latency_protocol, encrypted) {
 							tracing::debug!(
 								"Ignoring latency protocol message (negotiated: {}, encrypted: {encrypted}).",
 								context.latency_protocol
 							);
+						} else {
+							match latency_protocol::Message::decode(payload) {
+								Some(request @ latency_protocol::Message::ClockSyncRequest { .. }) => {
+									clock_sync_request = Some((request, latency_protocol::monotonic_ns(received_at)));
+								},
+								// Frame-clock corrections aren't applied yet.
+								Some(message) => tracing::trace!("Received latency protocol message: {message:?}"),
+								None => tracing::debug!(
+									"Ignoring latency protocol message of {} bytes: unknown version or type.",
+									payload.len()
+								),
+							}
 						}
 					},
 					skipped_message => {
@@ -599,6 +637,38 @@ async fn run_control_loop(
 			},
 			Ok(None) => (),
 			Err(_) => break,
+		}
+
+		// Answer a clock-sync request with the host's receive and send times.
+		if let Some((request, host_received)) = clock_sync_request
+			&& let Some(peer_id) = connected_peer
+		{
+			let key = context.keys_rx.borrow().remote_input_key.clone();
+			let host_sent = latency_protocol::monotonic_ns(std::time::Instant::now());
+			if let Some(reply) = latency_protocol::reply_to(request, host_received, host_sent) {
+				send_latency_message(&mut host, peer_id, &key, &mut sequence_number, &reply);
+				tracing::trace!("Answered clock-sync request: {reply:?}");
+			}
+		}
+
+		// Announce the capture epoch of the video RTP timestamps once the first frame has one, so
+		// the client can place each frame's capture on its own clock. It goes with a clock-sync
+		// reply: the client asks only once it listens for latency messages, and drops earlier ones.
+		if context.latency_protocol
+			&& !capture_epoch_sent
+			&& clock_sync_request.is_some()
+			&& let Some(peer_id) = connected_peer
+			&& let Some(epoch) = video_handle.rtp_epoch()
+		{
+			let key = context.keys_rx.borrow().remote_input_key.clone();
+			let epoch_ns = latency_protocol::monotonic_ns(epoch);
+			let message = latency_protocol::Message::CaptureEpoch {
+				epoch_ns,
+				rtp_clock_rate: RTP_CLOCK_RATE,
+			};
+			send_latency_message(&mut host, peer_id, &key, &mut sequence_number, &message);
+			capture_epoch_sent = true;
+			tracing::info!("Latency protocol: announced the capture epoch ({epoch_ns} ns, {RTP_CLOCK_RATE} Hz).");
 		}
 
 		// Send HDR mode notification after the host.service() match to avoid double mutable borrow.

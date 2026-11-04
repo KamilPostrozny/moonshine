@@ -26,7 +26,7 @@ use crate::session::stream::StartWaiter;
 use crate::session::stream::video::packetizer::Packetizer;
 use crate::session::stream::video::shard_batch::ShardBatch;
 use crate::session::stream::video::{
-	FrameStats, VideoChromaSampling, VideoDynamicRange, VideoFormat, VideoStreamConfig, VideoStreamContext,
+	FrameStats, RtpClock, VideoChromaSampling, VideoDynamicRange, VideoFormat, VideoStreamConfig, VideoStreamContext,
 };
 
 pub(crate) use dmabuf::KcmpProbe;
@@ -349,6 +349,7 @@ async fn run_packet_consumer(
 	mut packetizer: Packetizer,
 	ctx: VideoStreamContext,
 	config: VideoStreamConfig,
+	rtp_clock: RtpClock,
 ) {
 	let mut frame_number = 0u32;
 	let mut sequence_number = 0u32;
@@ -356,7 +357,6 @@ async fn run_packet_consumer(
 	let mut latency_samples: Vec<LatencySample> = Vec::with_capacity(512);
 	let mut last_summary_time = std::time::Instant::now();
 	let frame_interval_us = 1_000_000 / ctx.fps as u128;
-	let mut epoch = None;
 	let mut next_rtp_ticks = 0u64;
 
 	// Driven by the message channel: one `Frame` per submitted frame. When the
@@ -424,14 +424,10 @@ async fn run_packet_consumer(
 		let encoded_bytes = packet.data.len();
 		let is_key_frame = packet.is_key_frame;
 
-		// Clients take the RTP timestamp (90 kHz) as the frame's presentation time.
-		let epoch = *epoch.get_or_insert(frame_context.created_at);
-		let since_epoch = frame_context.created_at.duration_since(epoch);
-		// A re-encoded frame is stamped when it is encoded, which can be later
-		// than the capture time of a frame still in the queue.
-		let rtp_ticks = ((since_epoch.as_micros() * 90_000 / 1_000_000) as u64).max(next_rtp_ticks);
-		next_rtp_ticks = rtp_ticks + 1;
-		let rtp_timestamp = rtp_ticks as u32;
+		// Clients take the RTP timestamp (90 kHz) as the frame's presentation time. A re-encoded
+		// frame is stamped when it is encoded, which can be later than the capture time of a frame
+		// still in the queue.
+		let rtp_timestamp = rtp_clock.ticks(frame_context.created_at, &mut next_rtp_ticks) as u32;
 		frame_number += 1;
 
 		let t_start = std::time::Instant::now();
@@ -561,6 +557,7 @@ impl VideoPipeline {
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		start: StartWaiter,
 		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
+		rtp_clock: RtpClock,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video pipeline.");
 
@@ -568,6 +565,7 @@ impl VideoPipeline {
 			config,
 			context,
 			keys_rx,
+			rtp_clock,
 		};
 
 		// Capture the main (multi-threaded) runtime handle so the OS-threaded
@@ -602,6 +600,7 @@ struct VideoPipelineInner {
 	config: VideoStreamConfig,
 	context: VideoStreamContext,
 	keys_rx: SessionKeysReceiver,
+	rtp_clock: RtpClock,
 }
 
 impl VideoPipelineInner {
@@ -799,6 +798,7 @@ impl VideoPipelineInner {
 				packetizer,
 				ctx,
 				config,
+				self.rtp_clock.clone(),
 			))
 		};
 

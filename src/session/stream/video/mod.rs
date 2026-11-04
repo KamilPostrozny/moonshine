@@ -1,5 +1,6 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use async_shutdown::ShutdownManager;
 use serde::{Deserialize, Serialize};
@@ -257,6 +258,31 @@ pub struct VideoStreamContext {
 	pub encrypt_video: bool,
 }
 
+/// Ticks per second of the video RTP timestamps. Clients take them as the frame's presentation time.
+pub(crate) const RTP_CLOCK_RATE: u32 = 90_000;
+
+/// The clock of the video RTP timestamps: [`RTP_CLOCK_RATE`] ticks per second since the capture of
+/// the session's first frame, its epoch. Clones share the epoch.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RtpClock(Arc<OnceLock<Instant>>);
+
+impl RtpClock {
+	/// The capture time of RTP timestamp 0; `None` until the first frame is stamped.
+	pub fn epoch(&self) -> Option<Instant> {
+		self.0.get().copied()
+	}
+
+	/// The RTP ticks of a frame captured at `captured_at`, never less than `next`, which then
+	/// moves past them: a re-encoded frame can carry an older capture time than the last one.
+	pub fn ticks(&self, captured_at: Instant, next: &mut u64) -> u64 {
+		let epoch = *self.0.get_or_init(|| captured_at);
+		let since_epoch = captured_at.saturating_duration_since(epoch);
+		let ticks = ((since_epoch.as_micros() * RTP_CLOCK_RATE as u128 / 1_000_000) as u64).max(*next);
+		*next = ticks + 1;
+		ticks
+	}
+}
+
 /// Handle returned by `VideoStream::start` that gates the pipeline and packet handler.
 ///
 /// The pipeline and packet handler are spawned immediately but wait for the start flag
@@ -270,6 +296,8 @@ pub(crate) struct VideoStreamHandle {
 	invalidate_tx: broadcast::Sender<(u32, u32)>,
 	/// Set by a resume; the packet handler fires the reset on the client's next PING.
 	resume_pending: Arc<AtomicBool>,
+	/// The clock stamping the video RTP timestamps.
+	rtp_clock: RtpClock,
 }
 
 impl VideoStreamHandle {
@@ -291,6 +319,11 @@ impl VideoStreamHandle {
 	/// reference survives — much cheaper than always re-sending a keyframe.
 	pub fn invalidate_reference_frames(&self, first: u32, last: u32) {
 		let _ = self.invalidate_tx.send((first, last));
+	}
+
+	/// The capture time of video RTP timestamp 0; `None` until the first frame went out.
+	pub fn rtp_epoch(&self) -> Option<Instant> {
+		self.rtp_clock.epoch()
 	}
 
 	/// Reset the stream's frame/sequence counters for a resuming client.
@@ -405,6 +438,7 @@ impl VideoStream {
 		);
 
 		// Spawn pipeline thread — gated behind start.
+		let rtp_clock = RtpClock::default();
 		VideoPipeline::new(
 			frames,
 			config,
@@ -419,6 +453,7 @@ impl VideoStream {
 			hdr_metadata_tx,
 			start.waiter(),
 			stats_tx,
+			rtp_clock.clone(),
 		)
 		.map_err(|()| tracing::error!("Failed to create video pipeline"))?;
 
@@ -427,6 +462,7 @@ impl VideoStream {
 			idr_tx,
 			invalidate_tx,
 			resume_pending,
+			rtp_clock,
 		})
 	}
 }
@@ -631,5 +667,35 @@ mod tests {
 	#[test]
 	fn undersized_cap_is_ignored() {
 		assert_eq!(config(50).clamp_packet_size(1392), 1392);
+	}
+
+	#[test]
+	fn rtp_timestamps_count_90_khz_from_the_first_captured_frame() {
+		let clock = RtpClock::default();
+		assert_eq!(clock.epoch(), None);
+
+		let first = std::time::Instant::now();
+		let mut next = 0;
+		assert_eq!(clock.ticks(first, &mut next), 0);
+		assert_eq!(clock.epoch(), Some(first));
+		// 10 ms after the first capture is 900 ticks; the epoch stays the first capture.
+		assert_eq!(
+			clock.ticks(first + std::time::Duration::from_millis(10), &mut next),
+			900
+		);
+		assert_eq!(clock.epoch(), Some(first));
+		// A clone (the control stream's) sees the same epoch.
+		assert_eq!(clock.clone().epoch(), Some(first));
+	}
+
+	#[test]
+	fn rtp_timestamps_never_repeat_or_go_back() {
+		let clock = RtpClock::default();
+		let first = std::time::Instant::now();
+		let mut next = 0;
+		assert_eq!(clock.ticks(first + std::time::Duration::from_millis(10), &mut next), 0);
+		// A frame stamped no later than the last one (a re-encode of a queued capture) follows it.
+		assert_eq!(clock.ticks(first, &mut next), 1);
+		assert_eq!(clock.ticks(first, &mut next), 2);
 	}
 }

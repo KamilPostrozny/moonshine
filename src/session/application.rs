@@ -228,17 +228,21 @@ impl Drop for Application {
 
 /// Build environment variables for the application based on the context (e.g. display, PulseAudio socket).
 fn make_envs(context: &ApplicationContext, config_env: &BTreeMap<String, String>) -> Result<Vec<String>, ()> {
+	let pulse_runtime_path = context
+		.pulse_socket_path
+		.parent()
+		.ok_or_else(|| tracing::error!("Failed to get parent directory of PulseAudio socket."))?
+		.to_string_lossy();
 	// Build environment variables as "KEY=value" strings for systemd.
 	let mut envs: Vec<String> = vec![
 		format!("PULSE_SERVER=unix:{}", context.pulse_socket_path.display()),
-		format!(
-			"PULSE_RUNTIME_PATH={}",
-			context
-				.pulse_socket_path
-				.parent()
-				.ok_or_else(|| tracing::error!("Failed to get parent directory of PulseAudio socket."))?
-				.to_string_lossy()
-		),
+		format!("PULSE_RUNTIME_PATH={pulse_runtime_path}"),
+		// Native PipeWire clients (SDL's default backend, pipewire-alsa, pipewire-jack) ignore
+		// PULSE_SERVER. They look for `$PIPEWIRE_RUNTIME_DIR/$PIPEWIRE_REMOTE`, which doesn't
+		// exist next to Moonshine's Pulse socket, so they can't reach the desktop's PipeWire:
+		// SDL then falls back to Pulse, and audio reaches only the Stream.
+		format!("PIPEWIRE_RUNTIME_DIR={pulse_runtime_path}"),
+		"PIPEWIRE_REMOTE=pipewire-0".to_string(),
 		format!("DISPLAY=:{}", context.xdisplay),
 		format!("WAYLAND_DISPLAY={}", context.wayland_display),
 		// Force Proton to use winepulse.drv instead of winepipewire.drv,
@@ -871,6 +875,18 @@ mod tests {
 
 		assert_eq!(envs.last().map(String::as_str), Some("COSMIC_BACKEND=winit"));
 		assert!(envs.contains(&"DISPLAY=:0".to_string()));
+	}
+
+	#[test]
+	fn application_pipewire_clients_find_no_desktop_pipewire() {
+		let envs = make_envs(&test_context(), &BTreeMap::new()).unwrap();
+
+		// Native PipeWire clients (SDL's default backend, pipewire-alsa, pipewire-jack) look for
+		// the server's socket in PIPEWIRE_RUNTIME_DIR, which holds only Moonshine's Pulse socket,
+		// so they fail over to Pulse and reach Moonshine instead of the desktop's sinks.
+		assert!(envs.contains(&"PIPEWIRE_RUNTIME_DIR=/run/user/1000/moonshine/pulse".to_string()));
+		assert!(envs.contains(&"PIPEWIRE_REMOTE=pipewire-0".to_string()));
+		assert!(envs.contains(&"PULSE_SERVER=unix:/run/user/1000/moonshine/pulse/native".to_string()));
 	}
 
 	#[test]

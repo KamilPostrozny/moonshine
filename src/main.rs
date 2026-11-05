@@ -55,6 +55,9 @@ async fn main() -> Result<(), ()> {
 
 	let config_path = args.config.unwrap_or_else(default_config_path);
 	let config = Config::load_or_create(&config_path)?;
+	// Fail at start, not at the first session, on a name the session unit can't take.
+	let instance = moonshine::session::instance::SessionInstance::from_env()?;
+	tracing::info!("Session unit {}.", instance.unit_name());
 
 	// Standalone healthcheck subcommand — run checks and exit.
 	if let Some(Command::Healthcheck) = args.command {

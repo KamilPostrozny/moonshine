@@ -11,6 +11,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
 use crate::session::SessionKeysReceiver;
+use crate::session::instance::SessionInstance;
 use crate::session::manager::SessionShutdownReason;
 use crate::session::stream::{StartSignal, StartWaiter};
 
@@ -295,6 +296,7 @@ impl AudioStream {
 	pub async fn new(
 		config: AudioStreamConfig,
 		address: String,
+		instance: &SessionInstance,
 		stop: ShutdownManager<SessionShutdownReason>,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing audio stream.");
@@ -303,10 +305,11 @@ impl AudioStream {
 			.await
 			.map_err(|e| tracing::error!("Failed to bind to UDP socket: {e}"))?;
 
-		// Create the socket directory for the PulseAudio server.
+		// Create the socket directory for the PulseAudio server, the instance's own.
 		let pulse_socket_dir = dirs::runtime_dir()
 			.ok_or_else(|| tracing::error!("Failed to get runtime directory for PulseAudio socket"))?
-			.join("moonshine/pulse");
+			.join(instance.runtime_dir_name())
+			.join("pulse");
 		std::fs::create_dir_all(&pulse_socket_dir)
 			.map_err(|e| tracing::error!("Failed to create pulse socket directory: {e}"))?;
 		let pulse_socket_path = pulse_socket_dir.join("native");

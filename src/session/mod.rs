@@ -30,6 +30,7 @@ use self::stream::video::VideoStreamConfig;
 pub mod application;
 pub mod compositor;
 pub mod inhibit;
+pub mod instance;
 pub mod manager;
 pub mod stream;
 
@@ -156,7 +157,8 @@ impl InitializedSession {
 
 		// Create compositor, audio stream, video stream, and control stream.
 		let (compositor, handles) = Compositor::new(compositor_config, (&context).into(), stop.clone());
-		let audio = AudioStream::new(audio_config, address.clone(), stop.clone()).await?;
+		let instance = instance::SessionInstance::from_env()?;
+		let audio = AudioStream::new(audio_config, address.clone(), &instance, stop.clone()).await?;
 		let video_stream = VideoStream::new(
 			video_config.clone(),
 			address.clone(),
@@ -208,7 +210,7 @@ impl InitializedSession {
 		let application = Application::spawn(
 			context.application.clone(),
 			ApplicationContext {
-				unit_name: "moonshine-session.service".to_string(),
+				unit_name: instance::SessionInstance::from_env()?.unit_name(),
 				pulse_socket_path,
 				xdisplay: ready.xdisplay,
 				wayland_display: ready.wayland_display.clone(),

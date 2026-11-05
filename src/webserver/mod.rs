@@ -333,7 +333,10 @@ impl Webserver {
 
 		let response = if https {
 			match (request.method(), request.uri().path()) {
-				(&Method::GET, "/serverinfo") => self.server_info(params, local_address, mac_address, https).await,
+				(&Method::GET, "/serverinfo") => {
+					self.server_info(params, local_address, mac_address, https, &peer_cert_fingerprint)
+						.await
+				},
 				(&Method::GET, "/applist") => {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
 						return Ok(resp);
@@ -388,7 +391,10 @@ impl Webserver {
 			}
 		} else {
 			match (request.method(), request.uri().path()) {
-				(&Method::GET, "/serverinfo") => self.server_info(params, local_address, mac_address, https).await,
+				(&Method::GET, "/serverinfo") => {
+					self.server_info(params, local_address, mac_address, https, &peer_cert_fingerprint)
+						.await
+				},
 				(&Method::GET, "/pair") => {
 					if !self.webserver_config.enable_pairing {
 						tracing::warn!("Pairing is disabled in configuration.");
@@ -549,6 +555,7 @@ impl Webserver {
 		local_address: Option<SocketAddr>,
 		mac_address: Option<String>,
 		https: bool,
+		peer_cert_fingerprint: &Option<String>,
 	) -> Response<Full<Bytes>> {
 		let session_context = match self.session_manager.get_session_context().await {
 			Ok(session_context) => session_context,
@@ -559,15 +566,13 @@ impl Webserver {
 			},
 		};
 
-		// Seems we should only say we paired when using HTTPS.
-		let paired = if https {
-			match params.get("uniqueid") {
-				Some(unique_id) if self.client_manager.is_paired(unique_id.clone()).unwrap_or(false) => "1",
-				Some(_) | None => "0",
-			}
-		} else {
-			"0"
-		};
+		let unique_id_paired = params
+			.get("uniqueid")
+			.is_some_and(|unique_id| self.client_manager.is_paired(unique_id.clone()).unwrap_or(false));
+		let cert_paired = peer_cert_fingerprint
+			.as_deref()
+			.is_some_and(|fingerprint| self.client_manager.is_cert_paired(fingerprint).unwrap_or(false));
+		let paired = pair_status(https, unique_id_paired, cert_paired);
 
 		let local_ip = local_address.map(|addr| addr.ip().to_string()).unwrap_or_default();
 
@@ -982,6 +987,18 @@ impl Webserver {
 	}
 }
 
+/// `PairStatus` of `/serverinfo`: paired only over HTTPS, for a client whose unique ID paired
+/// here or whose TLS certificate is paired. Sunshine identifies clients by certificate alone,
+/// so the certificate covers pairings carried over from it and clients that send a per-install
+/// unique ID (newer moonlight-qt).
+fn pair_status(https: bool, unique_id_paired: bool, cert_paired: bool) -> &'static str {
+	if https && (unique_id_paired || cert_paired) {
+		"1"
+	} else {
+		"0"
+	}
+}
+
 /// Bind a TCP listener for the webserver. When the address is IPv6 we disable
 /// `IPV6_V6ONLY` so the single socket also accepts IPv4-mapped connections. This
 /// lets clients reach us over whichever family mDNS advertised (avahi publishes
@@ -1125,4 +1142,31 @@ fn escape_xml(input: impl AsRef<str>) -> String {
 		.replace(">", "&gt;")
 		.replace("\"", "&quot;")
 		.replace("'", "&apos;")
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn plain_http_never_reports_paired() {
+		assert_eq!(pair_status(false, true, true), "0");
+	}
+
+	#[test]
+	fn https_reports_paired_for_a_known_unique_id() {
+		assert_eq!(pair_status(true, true, false), "1");
+	}
+
+	// Pairings carried over from Sunshine know only client certificates, and newer
+	// moonlight-qt sends a per-install unique ID, as Sunshine never required one.
+	#[test]
+	fn https_reports_paired_for_a_paired_certificate_whatever_the_unique_id() {
+		assert_eq!(pair_status(true, false, true), "1");
+	}
+
+	#[test]
+	fn https_reports_unpaired_for_an_unknown_client() {
+		assert_eq!(pair_status(true, false, false), "0");
+	}
 }

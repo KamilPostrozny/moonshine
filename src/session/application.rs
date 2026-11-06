@@ -250,6 +250,18 @@ fn make_envs(context: &ApplicationContext, config_env: &BTreeMap<String, String>
 		"PROTON_USE_PIPEWIRE=0".to_string(),
 	];
 
+	// Forced sync: a GL Game with VSync off never waits for a frame callback, so ferriscope's
+	// steered tick can't pace it and it renders unbounded. Mesa's `vblank_mode=3` gives its GL a
+	// swap interval of at least 1 whatever the Game sets (Wayland EGL and GLX through Xwayland);
+	// NVIDIA's proprietary GL reads `__GL_SYNC_TO_VBLANK`. Pushed before the compositor's and the
+	// application's variables, so the application's own values (and Steam launch options, which
+	// Steam applies later) win. The opt-out is ferriscope-wsi's `FERRISCOPE_WSI_HOLD` (`fifo`,
+	// `off`): one switch keeps every Game's own VSync choice, Vulkan and GL alike.
+	if forces_sync(config_env) {
+		envs.push("vblank_mode=3".to_string());
+		envs.push("__GL_SYNC_TO_VBLANK=1".to_string());
+	}
+
 	// ferriscope's environment: the gamescope identity Steam uses for its
 	// external-overlay mode, the ferriscope-wsi layer, and the HDR and
 	// capability variables it actually backs.
@@ -267,6 +279,15 @@ fn make_envs(context: &ApplicationContext, config_env: &BTreeMap<String, String>
 	}
 
 	Ok(envs)
+}
+
+/// Whether a Game gets forced sync: not when its environment opts out of ferriscope-wsi's hold
+/// (`FERRISCOPE_WSI_HOLD` is `fifo`, `off`, `0` or `false`, as the layer parses it).
+fn forces_sync(config_env: &BTreeMap<String, String>) -> bool {
+	!matches!(
+		config_env.get("FERRISCOPE_WSI_HOLD").map(String::as_str),
+		Some("fifo" | "off" | "0" | "false")
+	)
 }
 
 /// Wait for a `JobRemoved` signal matching the given job path, accepting only `"done"` as success.
@@ -887,6 +908,45 @@ mod tests {
 		assert!(envs.contains(&"PIPEWIRE_RUNTIME_DIR=/run/user/1000/moonshine/pulse".to_string()));
 		assert!(envs.contains(&"PIPEWIRE_REMOTE=pipewire-0".to_string()));
 		assert!(envs.contains(&"PULSE_SERVER=unix:/run/user/1000/moonshine/pulse/native".to_string()));
+	}
+
+	/// The value systemd gives `key`: the last assignment wins.
+	fn effective<'a>(envs: &'a [String], key: &str) -> Option<&'a str> {
+		let prefix = format!("{key}=");
+		envs.iter().rev().find_map(|entry| entry.strip_prefix(prefix.as_str()))
+	}
+
+	#[test]
+	fn a_game_gets_forced_sync_by_default() {
+		let envs = make_envs(&test_context(), &BTreeMap::new()).unwrap();
+
+		assert_eq!(effective(&envs, "vblank_mode"), Some("3"));
+		assert_eq!(effective(&envs, "__GL_SYNC_TO_VBLANK"), Some("1"));
+	}
+
+	#[test]
+	fn the_hold_opt_out_keeps_the_games_own_vsync() {
+		for value in ["fifo", "off", "0", "false"] {
+			let env = BTreeMap::from([("FERRISCOPE_WSI_HOLD".to_string(), value.to_string())]);
+
+			let envs = make_envs(&test_context(), &env).unwrap();
+
+			assert_eq!(effective(&envs, "vblank_mode"), None, "FERRISCOPE_WSI_HOLD={value}");
+			assert_eq!(effective(&envs, "__GL_SYNC_TO_VBLANK"), None, "FERRISCOPE_WSI_HOLD={value}");
+		}
+	}
+
+	#[test]
+	fn a_games_own_vblank_mode_wins() {
+		let env = BTreeMap::from([
+			("vblank_mode".to_string(), "0".to_string()),
+			("__GL_SYNC_TO_VBLANK".to_string(), "0".to_string()),
+		]);
+
+		let envs = make_envs(&test_context(), &env).unwrap();
+
+		assert_eq!(effective(&envs, "vblank_mode"), Some("0"));
+		assert_eq!(effective(&envs, "__GL_SYNC_TO_VBLANK"), Some("0"));
 	}
 
 	#[test]

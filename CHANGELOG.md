@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Send a type-6 `FrameSent` latency message for every video frame written to the client: its frame number and when its socket writes started and ended, so the client can split each frame's arrival between the Host's send and the network.
 - Put the Stream's per-frame threads (ferriscope's compositor, the video pipeline and pixelforge's encode readback) on `SCHED_RR` priority 10 once the encoder exists, when `RLIMIT_RTPRIO` allows it, so a Game that saturates the CPU no longer delays them. Without the limit they keep their policy and a warning is logged.
 - Pin ferriscope at `d6b27e7` (`latency` with ticket 47): its WSI layer holds a Game in every present mode until the session's next tick, so a Game with VSync off (MAILBOX, IMMEDIATE) renders one frame per tick on the steered frame clock instead of unbounded. A Game can set `FERRISCOPE_WSI_HOLD=fifo` to hold FIFO only (the old behaviour) or `off`.
+- Forced sync for GL Games: every Game's environment carries `vblank_mode=3` (Mesa: a swap interval of at least 1 whatever the Game sets, on Wayland EGL and GLX through Xwayland) and `__GL_SYNC_TO_VBLANK=1` (NVIDIA's GL), so a GL Game with VSync off waits for ferriscope's tick and renders one frame per tick on the steered frame clock instead of unbounded. A Game's own values (application `env`, Steam launch options) win; `FERRISCOPE_WSI_HOLD=fifo` or `off` in the application's `env` opts out, keeping every Game's own VSync choice.
 
 ### Fixed
 

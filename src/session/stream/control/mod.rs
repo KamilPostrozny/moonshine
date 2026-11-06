@@ -437,6 +437,35 @@ fn build_termination_payload(error_code: u32) -> Vec<u8> {
 	buf
 }
 
+/// The ENet channel and packet mode a Host-to-client control message travels with.
+#[derive(Clone, Copy, Debug)]
+struct Delivery {
+	/// The channel, as moonlight-common-c's `CTRL_CHANNEL_*`.
+	channel: u8,
+	mode: PacketMode,
+}
+
+impl Delivery {
+	/// Rumble, LED, motion requests, HDR and termination: reliable on `CTRL_CHANNEL_GENERIC`.
+	const GENERIC: Self = Self {
+		channel: 0x00,
+		mode: PacketMode::ReliableSequenced,
+	};
+
+	/// Latency messages travel on their own channel (`CTRL_CHANNEL_LATENCY`, the one the client
+	/// sends its own on), so a message lost on the generic channel can't hold them up. The
+	/// per-frame `FrameSent` reports are telemetry: unreliable and unsequenced, they cost no
+	/// acknowledgement and a lost one holds up nothing. The rest (clock-sync replies, the capture
+	/// epoch, steerable reports) are reliable.
+	fn latency(message: &latency_protocol::Message) -> Self {
+		let mode = match message {
+			latency_protocol::Message::FrameSent { .. } => PacketMode::Unsequenced,
+			_ => PacketMode::ReliableSequenced,
+		};
+		Self { channel: 0x07, mode }
+	}
+}
+
 /// Send an encrypted control packet to the connected peer if it exists and is connected.
 fn send_to_peer(
 	host: &mut Host,
@@ -444,6 +473,7 @@ fn send_to_peer(
 	key: &[u8],
 	sequence_number: u32,
 	payload: &[u8],
+	delivery: Delivery,
 	label: &str,
 ) {
 	if let Ok(packet) = encode_control(key, sequence_number, payload)
@@ -451,7 +481,7 @@ fn send_to_peer(
 		&& peer.state() == PeerState::Connected
 	{
 		let _ = peer
-			.send(0, Packet::new(packet.as_slice(), PacketMode::ReliableSequenced))
+			.send(delivery.channel, Packet::new(packet.as_slice(), delivery.mode))
 			.map_err(|e| tracing::warn!("Failed to send {label} to peer: {e}"));
 	}
 }
@@ -471,7 +501,7 @@ fn send_hdr_state(
 		None
 	};
 	let payload = build_hdr_mode_payload(state.enabled, metadata.as_ref());
-	send_to_peer(host, peer_id, key, *sequence_number, &payload, label);
+	send_to_peer(host, peer_id, key, *sequence_number, &payload, Delivery::GENERIC, label);
 	*sequence_number += 1;
 	tracing::debug!("Sent HDR mode ({label}) to client: enabled={}", state.enabled);
 }
@@ -491,6 +521,7 @@ fn send_latency_message(
 		key,
 		*sequence_number,
 		&payload,
+		Delivery::latency(message),
 		"latency protocol message",
 	);
 	*sequence_number += 1;
@@ -552,14 +583,22 @@ async fn run_control_loop(
 			break;
 		}
 
-		// Check for feedback messages.
-		if let Ok(command) = feedback_rx.try_recv()
+		// Send every queued feedback message (rumble, LED, motion requests) on each turn.
+		while let Ok(command) = feedback_rx.try_recv()
 			&& let Some(peer_id) = client.peer()
 		{
 			tracing::debug!("Sending control feedback command: {command:?}");
 			let payload = command.as_packet();
 			let key = context.keys_rx.borrow().remote_input_key.clone();
-			send_to_peer(&mut host, peer_id, &key, sequence_number, &payload, "feedback");
+			send_to_peer(
+				&mut host,
+				peer_id,
+				&key,
+				sequence_number,
+				&payload,
+				Delivery::GENERIC,
+				"feedback",
+			);
 			sequence_number += 1;
 		}
 
@@ -647,7 +686,7 @@ async fn run_control_loop(
 						stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(stream_timeout);
 					},
 					ControlMessage::InputData(event) => {
-						let _ = input_handler.handle_raw_input(event, feedback_tx.clone()).await;
+						let _ = input_handler.handle_raw_input(event, feedback_tx.clone());
 					},
 					ControlMessage::HdrMode => {
 						tracing::info!("Received HdrMode toggle from client");
@@ -797,6 +836,7 @@ async fn run_control_loop(
 			&key,
 			sequence_number,
 			&termination_payload,
+			Delivery::GENERIC,
 			"termination",
 		);
 	}
@@ -870,6 +910,194 @@ mod tests {
 			panic!("expected an encrypted control message");
 		};
 		assert!(decrypt_control(&message, &[8; 16]).is_err());
+	}
+
+	/// An ENet host on loopback configured like the control stream's.
+	fn control_host() -> Host {
+		Host::new(HostConfig {
+			address: Some("127.0.0.1:0".parse().unwrap()),
+			peer_count: 1,
+			channel_limit: 0x30,
+			..Default::default()
+		})
+		.unwrap()
+	}
+
+	/// A client with moonlight-common-c's 0x30 channels connected to `server` through `address`:
+	/// the server's peer for it, and the client.
+	async fn connect(server: &mut Host, address: SocketAddr) -> (tokio_enet::PeerId, Host) {
+		let mut client = Host::new(HostConfig {
+			peer_count: 1,
+			channel_limit: 0x30,
+			..Default::default()
+		})
+		.unwrap();
+		client.connect(address, 0x30, 0).unwrap();
+		let deadline = std::time::Instant::now() + Duration::from_secs(5);
+		let (mut server_peer, mut client_connected) = (None, false);
+		while server_peer.is_none() || !client_connected {
+			assert!(std::time::Instant::now() < deadline, "the client never connected");
+			if let Some(Event::Connect { peer_id, .. }) = server.service(Duration::from_millis(1)).await.unwrap() {
+				server_peer = Some(peer_id);
+			}
+			if let Some(Event::Connect { .. }) = client.service(Duration::from_millis(1)).await.unwrap() {
+				client_connected = true;
+			}
+		}
+		(server_peer.unwrap(), client)
+	}
+
+	/// The control stream's ENet host, its peer for a client connected over loopback, and the client.
+	async fn connected_client() -> (Host, tokio_enet::PeerId, Host) {
+		let mut server = control_host();
+		let address = server.local_addr().unwrap();
+		let (peer, client) = connect(&mut server, address).await;
+		(server, peer, client)
+	}
+
+	/// The next control packet the client receives from `server`, with its channel.
+	async fn received(server: &mut Host, client: &mut Host) -> (u8, Packet) {
+		server.flush().await.unwrap();
+		let deadline = std::time::Instant::now() + Duration::from_secs(5);
+		loop {
+			assert!(std::time::Instant::now() < deadline, "the client received nothing");
+			if let Some(Event::Receive { channel_id, packet, .. }) =
+				client.service(Duration::from_millis(1)).await.unwrap()
+			{
+				return (channel_id, packet);
+			}
+			let _ = server.service(Duration::ZERO).await.unwrap();
+		}
+	}
+
+	/// The latency message in a control packet the host encrypted for the client.
+	fn latency_message_in(packet: &Packet) -> latency_protocol::Message {
+		let Ok(ControlMessage::Encrypted(message)) = ControlMessage::from_bytes(packet.data()) else {
+			panic!("expected an encrypted control message");
+		};
+		let mut initialization_vector = [0u8; 12];
+		initialization_vector[0..4].copy_from_slice(&message.sequence_number.to_le_bytes());
+		initialization_vector[10] = b'H';
+		initialization_vector[11] = b'C';
+		let decrypted = decrypt(&message.payload, &KEY, &initialization_vector, &message.tag).unwrap();
+		let Ok(ControlMessage::LatencyMessage(payload)) = ControlMessage::from_bytes(&decrypted) else {
+			panic!("expected a latency message");
+		};
+		latency_protocol::Message::decode(payload).unwrap()
+	}
+
+	#[tokio::test]
+	async fn frame_sent_goes_unsequenced_on_the_latency_channel() {
+		let (mut server, peer, mut client) = connected_client().await;
+		let frame_sent = latency_protocol::Message::FrameSent {
+			frame_number: 7,
+			send_started_ns: 1_000,
+			send_ended_ns: 2_000,
+		};
+		send_latency_message(&mut server, peer, &KEY, &mut 0, &frame_sent);
+		let (channel, packet) = received(&mut server, &mut client).await;
+		assert_eq!((channel, packet.mode()), (0x07, PacketMode::Unsequenced));
+		assert_eq!(latency_message_in(&packet), frame_sent);
+	}
+
+	#[tokio::test]
+	async fn the_locks_replies_stay_reliable_on_the_latency_channel() {
+		let (mut server, peer, mut client) = connected_client().await;
+		let mut sequence_number = 0;
+		for message in [
+			latency_protocol::Message::ClockSyncReply {
+				sequence: 3,
+				phone_sent: 10,
+				host_received: 20,
+				host_sent: 30,
+			},
+			latency_protocol::Message::CaptureEpoch {
+				epoch_ns: 40,
+				rtp_clock_rate: RTP_CLOCK_RATE,
+			},
+		] {
+			send_latency_message(&mut server, peer, &KEY, &mut sequence_number, &message);
+			let (channel, packet) = received(&mut server, &mut client).await;
+			assert_eq!((channel, packet.mode()), (0x07, PacketMode::ReliableSequenced));
+			assert_eq!(latency_message_in(&packet), message);
+		}
+	}
+
+	/// A UDP relay between a client and `server`; setting the flag drops the server's next
+	/// datagram long enough to carry a control message, as one lost Wi-Fi frame would.
+	/// Returns the address clients connect to.
+	async fn relay_losing_on_demand(
+		server: SocketAddr,
+		lose_next: std::sync::Arc<std::sync::atomic::AtomicBool>,
+	) -> SocketAddr {
+		use std::sync::atomic::Ordering;
+		let client_side = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		let server_side = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		server_side.connect(server).await.unwrap();
+		let relay = client_side.local_addr().unwrap();
+		tokio::spawn(async move {
+			let mut client = None;
+			let (mut from_client, mut from_server) = ([0u8; 2048], [0u8; 2048]);
+			loop {
+				tokio::select! {
+					Ok((length, address)) = client_side.recv_from(&mut from_client) => {
+						client = Some(address);
+						let _ = server_side.send(&from_client[..length]).await;
+					}
+					Ok(length) = server_side.recv(&mut from_server) => {
+						if length > MINIMUM_ENCRYPTED_LENGTH && lose_next.swap(false, Ordering::SeqCst) {
+							continue;
+						}
+						if let Some(client) = client {
+							let _ = client_side.send_to(&from_server[..length], client).await;
+						}
+					}
+				}
+			}
+		});
+		relay
+	}
+
+	#[tokio::test]
+	async fn a_lost_control_message_is_resent_after_about_one_round_trip() {
+		let lose_next = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+		let mut server = control_host();
+		let relay = relay_losing_on_demand(server.local_addr().unwrap(), lose_next.clone()).await;
+		let (peer, mut client) = connect(&mut server, relay).await;
+		let reply = latency_protocol::Message::ClockSyncReply {
+			sequence: 1,
+			phone_sent: 10,
+			host_received: 20,
+			host_sent: 30,
+		};
+
+		// The host measures the round trip from acknowledged messages; it starts at 500 ms.
+		let mut sequence_number = 0;
+		for _ in 0..50 {
+			send_latency_message(&mut server, peer, &KEY, &mut sequence_number, &reply);
+			let _ = received(&mut server, &mut client).await;
+			client.flush().await.unwrap();
+			let _ = server.service(Duration::from_millis(5)).await.unwrap();
+		}
+		let round_trip = server.peer(peer).unwrap().round_trip_time();
+		assert!(round_trip < 50, "loopback round trip {round_trip} ms");
+
+		lose_next.store(true, std::sync::atomic::Ordering::SeqCst);
+		send_latency_message(&mut server, peer, &KEY, &mut sequence_number, &reply);
+		let sent = std::time::Instant::now();
+		server.flush().await.unwrap();
+		let resent = loop {
+			assert!(sent.elapsed() < Duration::from_secs(10), "never resent");
+			let _ = server.service(Duration::from_millis(1)).await.unwrap();
+			if let Some(Event::Receive { .. }) = client.service(Duration::from_millis(1)).await.unwrap() {
+				break sent.elapsed();
+			}
+		};
+		assert!(!lose_next.load(std::sync::atomic::Ordering::SeqCst), "nothing was lost");
+		assert!(
+			resent < Duration::from_millis(250),
+			"resent after {resent:?} with a {round_trip} ms round trip"
+		);
 	}
 
 	#[test]

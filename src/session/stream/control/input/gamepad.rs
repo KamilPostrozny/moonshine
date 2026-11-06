@@ -293,6 +293,11 @@ impl GamepadMotion {
 			z: f32::from_le_bytes(buffer[12..16].try_into().unwrap()),
 		})
 	}
+
+	/// The sensor of the sample, as Moonlight's `LI_MOTION_TYPE_*`.
+	pub fn sensor(&self) -> u8 {
+		self.motion_type as u8
+	}
 }
 
 #[derive(Debug, FromRepr)]

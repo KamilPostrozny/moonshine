@@ -5,6 +5,7 @@ use std::time::Duration;
 use pulseaudio::protocol::stream::{BufferAttr, StreamFlags};
 use pulseaudio::protocol::{Prop, Props, SampleSpec};
 
+use crate::session::stream::audio::pulse_server::QueueStats;
 use crate::session::stream::audio::{AudioConfig, AudioStreamContext, SinkSpec};
 
 pub(crate) fn stream_start(ctx: &AudioStreamContext) {
@@ -97,4 +98,20 @@ pub(crate) fn pulse_stream_closed(
 		stream_spec.sample_rate as u64 * stream_spec.channels as u64 * stream_spec.format.bytes_per_sample() as u64;
 	let played_secs = played_bytes as f64 / bytes_per_sec.max(1) as f64;
 	tracing::debug!("Audio playback {owner} closed ({reason}) after {open_for:.3?}, played {played_secs:.3}s of audio");
+}
+
+/// The Host-side audio latency of a playing stream: what it had queued before each clock
+/// period since the last report.
+pub(crate) fn pulse_stream_queue(owner: StreamOwner, stream_spec: SampleSpec, queue: &QueueStats) {
+	let bytes_per_ms =
+		stream_spec.sample_rate as f64 * stream_spec.channels as f64 * stream_spec.format.bytes_per_sample() as f64
+			/ 1000.0;
+	let ms = |bytes: f64| bytes / bytes_per_ms.max(1.0);
+	tracing::debug!(
+		"Audio playback {owner} queue: {:.1} ms on average, {:.1} ms at most over {} periods, {} underruns",
+		ms(queue.queued_sum as f64 / queue.periods.max(1) as f64),
+		ms(queue.queued_max as f64),
+		queue.periods,
+		queue.underruns,
+	);
 }

@@ -5,7 +5,7 @@ use pulseaudio::protocol::{self as pulse, ClientInfoList};
 
 use crate::session::stream::audio::buffer::PlaybackBuffer;
 use crate::session::stream::audio::pulse_server::{
-	Client, ClientWriter, Error, PlaybackStream, SINK_NAME, ServerState, StreamState, pop_missing,
+	Client, ClientWriter, Error, PlaybackStream, QueueStats, SINK_NAME, ServerState, StreamState, pop_missing,
 };
 use crate::session::stream::audio::{AudioChannels, log};
 
@@ -141,7 +141,7 @@ pub(super) fn handle_command(
 			};
 
 			let mut buffer_attr = params.buffer_attr;
-			configure_buffer(&mut buffer_attr, &stream_spec);
+			configure_buffer(&mut buffer_attr, &stream_spec, server.default_target_length_ms);
 
 			let target_length = buffer_attr.target_length;
 			let flags = params.flags;
@@ -180,6 +180,7 @@ pub(super) fn handle_command(
 				write_offset: 0,
 				read_offset: 0,
 				opened_at: time::Instant::now(),
+				queue: QueueStats::default(),
 			};
 
 			if buffer_attr.pre_buffering == 0 || flags.start_corked {
@@ -408,9 +409,10 @@ pub(super) fn handle_command(
 			{
 				stream.state = StreamState::Prebuffering(stream.buffer_attr.pre_buffering as u64);
 				// Mirror the underflow re-entry path: seed missing so pop_missing
-				// immediately issues a seeding REQUEST on the next clock tick, and
-				// discard stale in-flight credit accumulated while Playing.
-				stream.missing = stream.buffer_attr.pre_buffering as i64;
+				// immediately issues a REQUEST refilling the target on the next clock
+				// tick, and discard stale in-flight credit accumulated while Playing.
+				stream.missing =
+					(stream.buffer_attr.target_length as usize).saturating_sub(stream.buffer.len_bytes()) as i64;
 				stream.requested = 0;
 			}
 			pulse::write_ack_message(&mut ClientWriter(&mut client.outgoing), seq)?;
@@ -447,7 +449,7 @@ pub(super) fn handle_command(
 			if let Some(stream) = client.playback_streams.get_mut(&params.index) {
 				stream.buffer_attr = params.buffer_attr;
 				let sample_spec = stream.buffer.stream_spec();
-				configure_buffer(&mut stream.buffer_attr, &sample_spec);
+				configure_buffer(&mut stream.buffer_attr, &sample_spec, server.default_target_length_ms);
 
 				// Re-seed missing based on the new target so the next pop_missing()
 				// issues a correctly-sized REQUEST.
@@ -609,7 +611,14 @@ pub(super) fn handle_stream_write(client: &mut Client, desc: pulse::Descriptor, 
 	Ok(())
 }
 
-fn configure_buffer(attr: &mut pulse::stream::BufferAttr, spec: &pulse::SampleSpec) {
+/// Fixes up a playback stream's buffer attributes.
+///
+/// The minimum request is at least one 5 ms clock period. The target length is what the
+/// client asks for, or `default_target_length_ms` when it leaves it unset, rounded up to
+/// whole minimum requests and never below two of them (10 ms). Pre-buffering is one
+/// minimum request, so a stream starts, and re-primes after an underrun, as soon as one
+/// period of audio is queued; a client's 0 (no pre-buffering) stays 0.
+fn configure_buffer(attr: &mut pulse::stream::BufferAttr, spec: &pulse::SampleSpec, default_target_length_ms: u32) {
 	let sample_size = spec.format.bytes_per_sample();
 	let frame_size = spec.channels as usize * sample_size;
 	let len_10ms = (frame_size * spec.sample_rate as usize / 100) as u32;
@@ -630,28 +639,16 @@ fn configure_buffer(attr: &mut pulse::stream::BufferAttr, spec: &pulse::SampleSp
 	}
 
 	if attr.target_length == u32::MAX {
-		attr.target_length = (len_10ms * 6)
-			.next_multiple_of(attr.minimum_request_length)
-			.min(attr.max_length);
-	} else {
-		attr.target_length = attr
-			.target_length
-			.next_multiple_of(attr.minimum_request_length)
-			.max(len_10ms * 6)
-			.min(attr.max_length);
-
-		if attr.target_length < (attr.minimum_request_length * 2) {
-			attr.target_length = attr.minimum_request_length * 2;
-		}
+		attr.target_length = (len_10ms as u64 * default_target_length_ms as u64 / 10) as u32;
 	}
+	attr.target_length = attr
+		.target_length
+		.next_multiple_of(attr.minimum_request_length)
+		.min(attr.max_length)
+		.max(attr.minimum_request_length * 2);
 
-	if attr.pre_buffering == u32::MAX {
-		attr.pre_buffering = attr.target_length;
-	} else {
-		attr.pre_buffering = attr
-			.pre_buffering
-			.next_multiple_of(attr.minimum_request_length)
-			.min(attr.target_length);
+	if attr.pre_buffering != 0 {
+		attr.pre_buffering = attr.minimum_request_length;
 	}
 }
 

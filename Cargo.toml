@@ -59,7 +59,10 @@ notify-rust = "4.17.0"
 open = "5.3.5"
 opus = "0.3.1"
 pkcs8 = "0.11.0"
-pixelforge = { git = "https://github.com/hgaiser/pixelforge", tag = "v0.10.0", features = ["dmabuf"] }
+# v0.10.0 plus upstream's reference-window fix (`f046afe`, only on upstream main, which
+# changes the encode API): RADV predicts HEVC/AV1 frames from one reference, and v0.10.0
+# sized the whole window by that, so every reference frame invalidation became an IDR.
+pixelforge = { git = "https://github.com/KamilPostrozny/pixelforge", rev = "4262658941fb988ab0f6b03cd550b8803be8cc8c", features = ["dmabuf"] }
 pulseaudio = "0.3.1"
 rcgen = "0.14.8"
 rsa = "0.9.10"

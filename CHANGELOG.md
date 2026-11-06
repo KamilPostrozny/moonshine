@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Apply negotiated type-3 relative frame-clock corrections to the session's ferriscope compositor. Pin ferriscope to `KamilPostrozny/ferriscope` at `c3e1c06`: period within 1% of nominal, phase shift at most half a period per message and pending in total, slewed at most 250 µs per frame. After one second without corrections, ferriscope returns to nominal.
 - Send the type-4 steerable report after the client's first clock-sync request, and again when the compositor installs a correction. The acknowledgement is the sequence installed by the compositor thread, not merely queued by the control stream. All Moonshine Streams capture ferriscope's session, whose tick paces native Wayland and Xwayland clients, including Steam.
 
+### Fixed
+
+- Recover a lost frame by reference frame invalidation instead of an IDR. A client that sends `maxNumReferenceFrames=0` ("the codec's maximum", every RFI-capable Moonlight) gets pixelforge's default window of 4 references instead of 1. Pin pixelforge to `KamilPostrozny/pixelforge` at `4262658` (v0.10.0 plus upstream `f046afe`), which keeps that window when the device predicts each frame from one reference (RADV HEVC and AV1).
+
 ## [v0.16.1] - 13-09-2026
 
 ### Added

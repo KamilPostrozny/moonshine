@@ -362,8 +362,7 @@ impl RtspServer {
 			get_optional_sdp_attribute(&sdp_session, "x-ss-video[0].chromaSamplingType").unwrap_or_default();
 		let chroma_sampling_type = VideoChromaSampling::try_from(chroma_sampling_type).unwrap_or_default();
 
-		let max_reference_frames: u32 =
-			get_optional_sdp_attribute(&sdp_session, "x-nv-video[0].maxNumReferenceFrames").unwrap_or(1);
+		let max_reference_frames = reference_window(&sdp_session);
 
 		// Bit 0 selects full-range luma, the remaining bits an SDR colorspace.
 		// Sunshine: `colorspace_from_client_config()`
@@ -625,6 +624,25 @@ fn client_feature_flags(sdp_session: &sdp_types::Session) -> Option<u32> {
 	get_optional_sdp_attribute(sdp_session, "x-ml-general.featureFlags")
 }
 
+/// Reference window used when the client leaves it to the Host.
+///
+/// pixelforge's default: within every HEVC level 5.1 resolution's DPB (window plus the frame
+/// being encoded is at most 6), and wide enough that a loss reported a few frames late still
+/// leaves an older reference to recover from.
+const HOST_REFERENCE_WINDOW: u32 = pixelforge::DEFAULT_MAX_REFERENCE_FRAMES;
+
+/// How many references the encoder keeps, from the client's `x-nv-video[0].maxNumReferenceFrames`.
+///
+/// An RFI-capable client sends 0, meaning "the codec's maximum" (Sunshine uses the encoder
+/// default). Passed through, pixelforge would keep one reference, and every reference frame
+/// invalidation would fall back to an IDR. A client that sends nothing gets one reference.
+fn reference_window(sdp_session: &sdp_types::Session) -> u32 {
+	match get_optional_sdp_attribute(sdp_session, "x-nv-video[0].maxNumReferenceFrames") {
+		Some(0) => HOST_REFERENCE_WINDOW,
+		requested => requested.unwrap_or(1),
+	}
+}
+
 fn get_optional_sdp_attribute<F: FromStr>(sdp_session: &sdp_types::Session, attribute: &str) -> Option<F> {
 	sdp_session
 		.get_first_attribute_value(attribute)
@@ -678,5 +696,22 @@ mod tests {
 		let no_flags = announce("");
 		assert_eq!(client_feature_flags(&no_flags), None);
 		assert!(!latency_protocol::negotiated(client_feature_flags(&no_flags), true));
+	}
+
+	#[test]
+	fn announce_asking_for_the_codec_maximum_gets_a_host_chosen_reference_window() {
+		// An RFI-capable client sends 0 for "the codec's maximum" (moonlight-common-c `SdpGenerator.c`).
+		let rfi = announce("a=x-nv-video[0].maxNumReferenceFrames:0 \r\n");
+		assert_eq!(reference_window(&rfi), HOST_REFERENCE_WINDOW);
+		assert!(reference_window(&rfi) > 1);
+	}
+
+	#[test]
+	fn announce_with_an_explicit_reference_count_keeps_it() {
+		let one = announce("a=x-nv-video[0].maxNumReferenceFrames:1 \r\n");
+		assert_eq!(reference_window(&one), 1);
+		let three = announce("a=x-nv-video[0].maxNumReferenceFrames:3 \r\n");
+		assert_eq!(reference_window(&three), 3);
+		assert_eq!(reference_window(&announce("")), 1);
 	}
 }

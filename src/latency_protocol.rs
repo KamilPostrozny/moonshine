@@ -80,9 +80,15 @@ pub enum Message {
 		period_ns: u64,
 		phase_shift_ns: i64,
 	},
-	/// Type 4, host → client: whether the host can steer the Game's frames, and the last
-	/// correction it applied (0: none).
-	SteerableReport { steerable: bool, last_correction: u32 },
+	/// Type 4, host → client: whether the host can steer the Game's frames, the last correction it
+	/// applied (0: none), and optionally the compositor's nominal frame period (`1 / rate`), which
+	/// corrections must stay within 1% of. The period trails the short form, so older decoders
+	/// still read the report.
+	SteerableReport {
+		steerable: bool,
+		last_correction: u32,
+		nominal_period_ns: Option<u64>,
+	},
 	/// Type 5, host → client: the host time of video RTP timestamp 0, and the RTP clock rate.
 	CaptureEpoch { epoch_ns: u64, rtp_clock_rate: u32 },
 	/// Type 6, host → client: the host wrote a video frame's packets to its socket, from the start
@@ -96,7 +102,8 @@ pub enum Message {
 
 impl Message {
 	/// Decode a payload; `None` for another version, an unknown type or too few bytes. Bytes past
-	/// the message's fields are ignored.
+	/// the message's fields are ignored. An optional field comes last and is read only when all its
+	/// bytes are there.
 	pub fn decode(payload: &[u8]) -> Option<Self> {
 		let mut reader = Reader(payload);
 		if reader.u8()? != VERSION {
@@ -121,6 +128,7 @@ impl Message {
 			4 => Some(Self::SteerableReport {
 				steerable: reader.u8()? != 0,
 				last_correction: reader.u32()?,
+				nominal_period_ns: reader.u64(),
 			}),
 			5 => Some(Self::CaptureEpoch {
 				epoch_ns: reader.u64()?,
@@ -169,10 +177,14 @@ impl Message {
 			Self::SteerableReport {
 				steerable,
 				last_correction,
+				nominal_period_ns,
 			} => {
 				buffer.push(4);
 				buffer.push(steerable as u8);
 				buffer.extend(last_correction.to_le_bytes());
+				if let Some(nominal) = nominal_period_ns {
+					buffer.extend(nominal.to_le_bytes());
+				}
 			},
 			Self::CaptureEpoch {
 				epoch_ns,
@@ -338,14 +350,30 @@ mod tests {
 		0x70, 0x2F, 0xFC, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
 	];
 
+	// From a host that doesn't say its nominal period: the short form.
 	const STEERABLE_REPORT: Message = Message::SteerableReport {
 		steerable: true,
 		last_correction: 0x0102,
+		nominal_period_ns: None,
 	};
 	const STEERABLE_REPORT_BYTES: &[u8] = &[
 		0x01, 0x04, //
 		0x01, //
 		0x02, 0x01, 0x00, 0x00,
+	];
+
+	// The long form: the same report from a host whose compositor runs at 120 fps, whose nominal
+	// period is 8.333333 ms.
+	const STEERABLE_REPORT_WITH_NOMINAL: Message = Message::SteerableReport {
+		steerable: true,
+		last_correction: 0x0102,
+		nominal_period_ns: Some(8_333_333),
+	};
+	const STEERABLE_REPORT_WITH_NOMINAL_BYTES: &[u8] = &[
+		0x01, 0x04, //
+		0x01, //
+		0x02, 0x01, 0x00, 0x00, //
+		0x15, 0x28, 0x7F, 0x00, 0x00, 0x00, 0x00, 0x00,
 	];
 
 	const CAPTURE_EPOCH: Message = Message::CaptureEpoch {
@@ -371,11 +399,12 @@ mod tests {
 		0x50, 0x3D, 0x8F, 0x91, 0x94, 0x4E, 0x00, 0x00,
 	];
 
-	const FIXTURES: [(Message, &[u8]); 6] = [
+	const FIXTURES: [(Message, &[u8]); 7] = [
 		(SYNC_REQUEST, SYNC_REQUEST_BYTES),
 		(SYNC_REPLY, SYNC_REPLY_BYTES),
 		(CORRECTION, CORRECTION_BYTES),
 		(STEERABLE_REPORT, STEERABLE_REPORT_BYTES),
+		(STEERABLE_REPORT_WITH_NOMINAL, STEERABLE_REPORT_WITH_NOMINAL_BYTES),
 		(CAPTURE_EPOCH, CAPTURE_EPOCH_BYTES),
 		(FRAME_SENT, FRAME_SENT_BYTES),
 	];
@@ -386,6 +415,21 @@ mod tests {
 			assert_eq!(message.encode(), bytes, "{message:?}");
 			assert_eq!(Message::decode(bytes), Some(message));
 		}
+	}
+
+	#[test]
+	fn every_message_type_the_codec_reads_has_a_byte_fixture() {
+		// A new message type fails here until the fixtures (and the client's) have it.
+		let decoded: Vec<u8> = (u8::MIN..=u8::MAX)
+			.filter(|&kind| {
+				let mut bytes = vec![VERSION, kind];
+				bytes.extend([0; 64]);
+				Message::decode(&bytes).is_some()
+			})
+			.collect();
+		let mut fixture_types: Vec<u8> = FIXTURES.iter().map(|(_, bytes)| bytes[1]).collect();
+		fixture_types.dedup();
+		assert_eq!(decoded, fixture_types);
 	}
 
 	#[test]
@@ -402,8 +446,10 @@ mod tests {
 		}
 		assert_eq!(Message::decode(&[]), None);
 		assert_eq!(Message::decode(&[0x01]), None);
-		for (_, bytes) in FIXTURES {
-			assert_eq!(Message::decode(&bytes[..bytes.len() - 1]), None);
+		for (message, bytes) in FIXTURES {
+			if message != STEERABLE_REPORT_WITH_NOMINAL {
+				assert_eq!(Message::decode(&bytes[..bytes.len() - 1]), None);
+			}
 		}
 	}
 
@@ -417,6 +463,15 @@ mod tests {
 	}
 
 	#[test]
+	fn a_steerable_reports_nominal_period_is_optional_trailing_bytes() {
+		// An older host's short report has no nominal period; a long one cut short is the short one
+		// with a few bytes past its fields.
+		assert_eq!(Message::decode(STEERABLE_REPORT_BYTES), Some(STEERABLE_REPORT));
+		let cut = &STEERABLE_REPORT_WITH_NOMINAL_BYTES[..STEERABLE_REPORT_WITH_NOMINAL_BYTES.len() - 1];
+		assert_eq!(Message::decode(cut), Some(STEERABLE_REPORT));
+	}
+
+	#[test]
 	fn any_non_zero_steerable_byte_means_steerable() {
 		let mut bytes = STEERABLE_REPORT_BYTES.to_vec();
 		bytes[2] = 0x00;
@@ -424,7 +479,8 @@ mod tests {
 			Message::decode(&bytes),
 			Some(Message::SteerableReport {
 				steerable: false,
-				last_correction: 0x0102
+				last_correction: 0x0102,
+				nominal_period_ns: None,
 			})
 		);
 		bytes[2] = 0x80;
@@ -443,7 +499,14 @@ mod tests {
 				host_sent: 0x0000_0012_3456_ABCD,
 			})
 		);
-		for other in [SYNC_REPLY, CORRECTION, STEERABLE_REPORT, CAPTURE_EPOCH, FRAME_SENT] {
+		for other in [
+			SYNC_REPLY,
+			CORRECTION,
+			STEERABLE_REPORT,
+			STEERABLE_REPORT_WITH_NOMINAL,
+			CAPTURE_EPOCH,
+			FRAME_SENT,
+		] {
 			assert_eq!(reply_to(other, 1, 2), None);
 		}
 	}

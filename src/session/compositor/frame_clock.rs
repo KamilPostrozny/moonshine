@@ -23,9 +23,15 @@ impl CompositorFrameClock {
 	///
 	/// `steerable` means the compositor's frame clock is connected to this session,
 	/// not that its thread is alive: a stalled compositor still reports steerable,
-	/// and the client sees it as corrections that are never acknowledged.
+	/// and the client sees it as corrections that are never acknowledged. A steerable
+	/// report carries the compositor's nominal period, which the client sizes its
+	/// corrections from (the compositor keeps its launch rate across a resume).
 	pub(crate) fn report(&self) -> Message {
-		report(self.0.get().map(FrameClockSender::last_applied))
+		report(
+			self.0
+				.get()
+				.map(|sender| (sender.last_applied(), sender.nominal_period())),
+		)
 	}
 
 	/// A new client connected: its correction sequences start over, so neither the
@@ -46,10 +52,12 @@ impl CompositorFrameClock {
 	}
 }
 
-fn report(applied: Option<u32>) -> Message {
+/// The report for a clock that installed `applied` last at its `nominal` period, or for none.
+fn report(clock: Option<(u32, Duration)>) -> Message {
 	Message::SteerableReport {
-		steerable: applied.is_some(),
-		last_correction: applied.unwrap_or(0),
+		steerable: clock.is_some(),
+		last_correction: clock.map_or(0, |(applied, _)| applied),
+		nominal_period_ns: clock.map(|(_, nominal)| nominal.as_nanos() as u64),
 	}
 }
 
@@ -86,25 +94,28 @@ mod tests {
 			clock.report(),
 			Message::SteerableReport {
 				steerable: false,
-				last_correction: 0
+				last_correction: 0,
+				nominal_period_ns: None,
 			}
 		);
 	}
 
 	#[test]
-	fn a_connected_clock_reports_only_the_sequence_installed_by_the_compositor() {
+	fn a_connected_clock_reports_the_sequence_installed_and_the_compositors_nominal_period() {
 		assert_eq!(
-			report(Some(0)),
+			report(Some((0, Duration::from_nanos(8_333_333)))),
 			Message::SteerableReport {
 				steerable: true,
-				last_correction: 0
+				last_correction: 0,
+				nominal_period_ns: Some(8_333_333),
 			}
 		);
 		assert_eq!(
-			report(Some(7)),
+			report(Some((7, Duration::from_nanos(16_666_667)))),
 			Message::SteerableReport {
 				steerable: true,
-				last_correction: 7
+				last_correction: 7,
+				nominal_period_ns: Some(16_666_667),
 			}
 		);
 	}

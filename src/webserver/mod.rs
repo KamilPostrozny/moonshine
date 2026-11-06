@@ -723,32 +723,9 @@ impl Webserver {
 				return xml_error(400, &message);
 			},
 		};
-		let mode_parts: Vec<&str> = mode.split('x').collect();
-		if mode_parts.len() != 3 {
-			let message = format!("Expected mode in format WxHxR, but got '{mode}'.");
-			tracing::warn!("{message}");
-			return xml_error(400, &message);
-		}
-		let width: u32 = match mode_parts[0].parse() {
-			Ok(width) => width,
-			Err(e) => {
-				let message = format!("Failed to parse width: {e}");
-				tracing::warn!("{message}");
-				return xml_error(400, &message);
-			},
-		};
-		let height: u32 = match mode_parts[1].parse() {
-			Ok(height) => height,
-			Err(e) => {
-				let message = format!("Failed to parse height: {e}");
-				tracing::warn!("{message}");
-				return xml_error(400, &message);
-			},
-		};
-		let refresh_rate: u32 = match mode_parts[2].parse() {
-			Ok(refresh_rate) => refresh_rate,
-			Err(e) => {
-				let message = format!("Failed to parse refresh rate: {e}");
+		let (width, height, refresh_rate) = match parse_mode(&mode) {
+			Ok(mode) => mode,
+			Err(message) => {
 				tracing::warn!("{message}");
 				return xml_error(400, &message);
 			},
@@ -913,6 +890,13 @@ impl Webserver {
 			},
 		};
 
+		if let Ok(Some(context)) = self.session_manager.get_session_context().await
+			&& let Some(message) = resume_refusal(context.refresh_rate, params.get("mode").map(String::as_str))
+		{
+			tracing::warn!("{message}");
+			return xml_error(RESUME_AT_ANOTHER_RATE_STATUS, &message);
+		}
+
 		match self
 			.session_manager
 			.update_keys(SessionKeyData {
@@ -1036,6 +1020,36 @@ fn rtsp_host(ip: IpAddr) -> String {
 		IpAddr::V4(v4) => v4.to_string(),
 		IpAddr::V6(v6) => format!("[{v6}]"),
 	}
+}
+
+/// The `status_code` of a `/resume` refused because it asks for another frame rate than the
+/// running compositor's. moonlight-ios recognises it (`HostClient.resumeAtAnotherFrameRateStatus`)
+/// and offers to quit the Game and launch it fresh at the new rate.
+const RESUME_AT_ANOTHER_RATE_STATUS: u16 = 409;
+
+/// A launch or resume `mode`: width, height and frame rate, as `WxHxR`.
+fn parse_mode(mode: &str) -> Result<(u32, u32, u32), String> {
+	let parts: Vec<&str> = mode.split('x').collect();
+	let [width, height, rate] = parts[..] else {
+		return Err(format!("Expected mode in format WxHxR, but got '{mode}'."));
+	};
+	let width = width.parse().map_err(|e| format!("Failed to parse width: {e}"))?;
+	let height = height.parse().map_err(|e| format!("Failed to parse height: {e}"))?;
+	let rate = rate.parse().map_err(|e| format!("Failed to parse refresh rate: {e}"))?;
+	Ok((width, height, rate))
+}
+
+/// Why a resume asking for `mode` can't join a session whose compositor runs at `running_rate`:
+/// the compositor keeps the rate the Game was launched at, and refuses frame clock corrections
+/// more than 1% from it, so a client streaming at another rate could never steer it. `None` when
+/// the resume may go ahead: the same rate, or no readable mode (as before modes were checked).
+fn resume_refusal(running_rate: u32, mode: Option<&str>) -> Option<String> {
+	let (_, _, rate) = parse_mode(mode?).ok()?;
+	(rate != running_rate).then(|| {
+		format!(
+			"The Game runs at {running_rate} fps and can't be resumed at {rate} fps; quit it to stream at {rate} fps."
+		)
+	})
 }
 
 fn bad_request(message: String) -> Response<Full<Bytes>> {
@@ -1168,5 +1182,27 @@ mod tests {
 	#[test]
 	fn https_reports_unpaired_for_an_unknown_client() {
 		assert_eq!(pair_status(true, false, false), "0");
+	}
+
+	#[test]
+	fn a_resume_at_another_rate_than_the_running_compositors_is_refused() {
+		// moonlight-ios recognises the refusal by its status (`HostClient.resumeAtAnotherFrameRateStatus`).
+		assert_eq!(RESUME_AT_ANOTHER_RATE_STATUS, 409);
+		assert!(resume_refusal(120, Some("2736x1260x60")).is_some());
+		assert!(resume_refusal(60, Some("1280x720x120")).is_some());
+	}
+
+	#[test]
+	fn a_resume_at_the_running_rate_or_without_a_readable_mode_goes_ahead() {
+		assert_eq!(resume_refusal(120, Some("2736x1260x120")), None);
+		assert_eq!(resume_refusal(120, None), None);
+		assert_eq!(resume_refusal(120, Some("2736x1260")), None);
+	}
+
+	#[test]
+	fn a_mode_is_width_height_and_rate() {
+		assert_eq!(parse_mode("2736x1260x120"), Ok((2736, 1260, 120)));
+		assert!(parse_mode("2736x1260").is_err());
+		assert!(parse_mode("2736x1260xfast").is_err());
 	}
 }

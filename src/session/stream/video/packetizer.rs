@@ -52,6 +52,21 @@ enum RtpFlag {
 	StartOfFrame = 0x4,
 }
 
+/// What a frame is to the client: the frame header's type byte, which moonlight-common-c reads
+/// (`VideoDepacketizer.c`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FrameKind {
+	/// Predicted from the previous frames.
+	Predicted = 1,
+	/// A key (IDR) frame.
+	Key = 2,
+	/// The first frame encoded after a reference frame invalidation, predicted only from
+	/// references the client still has. After a loss the client drops every frame until a key or
+	/// recovery frame, and keeps asking for an invalidation meanwhile.
+	Recovery = 5,
+}
+
 #[derive(Debug)]
 #[repr(C)]
 struct VideoFrameHeader {
@@ -203,7 +218,7 @@ impl Packetizer {
 	pub fn packetize(
 		&mut self,
 		encoded_data: &[u8],
-		is_key_frame: bool,
+		kind: FrameKind,
 		requested_packet_size: usize,
 		minimum_fec_packets: u32,
 		fec_percentage: u8,
@@ -216,10 +231,10 @@ impl Packetizer {
 		self.maybe_update_cipher();
 
 		tracing::trace!(
-			"Packetizing frame {}, size={}, keyframe={}",
+			"Packetizing frame {}, size={}, kind={:?}",
 			frame_number,
 			encoded_data.len(),
-			is_key_frame
+			kind
 		);
 
 		let requested_shard_payload_size = requested_packet_size - NV_VIDEO_PACKET_SIZE;
@@ -234,7 +249,7 @@ impl Packetizer {
 		let video_frame_header = VideoFrameHeader {
 			header_type: 0x01,
 			frame_processing_latency,
-			frame_type: if is_key_frame { 2 } else { 1 },
+			frame_type: kind as u8,
 			last_payload_len: last_shard_size as u32,
 		};
 
@@ -496,7 +511,9 @@ mod tests {
 			(4092, vec![(1023, 0); 4]),
 		] {
 			let data = frame(shards);
-			let batch = packetizer().packetize(&data, true, 80, 2, 20, 1, &mut 0, 0, 0).unwrap();
+			let batch = packetizer()
+				.packetize(&data, FrameKind::Key, 80, 2, 20, 1, &mut 0, 0, 0)
+				.unwrap();
 			let blocks = blocks(&batch);
 			let wire: Vec<_> = blocks.iter().map(|block| counts(block[0])).collect();
 			assert_eq!(wire, layout, "{shards} data packets");
@@ -513,7 +530,7 @@ mod tests {
 	#[test]
 	fn oversized_frame_does_not_consume_sequence_numbers() {
 		let mut sequence = 77;
-		let result = packetizer().packetize(&frame(4093), true, 80, 2, 20, 1, &mut sequence, 0, 0);
+		let result = packetizer().packetize(&frame(4093), FrameKind::Key, 80, 2, 20, 1, &mut sequence, 0, 0);
 		assert!(result.is_err());
 		assert_eq!(sequence, 77);
 	}
@@ -524,7 +541,17 @@ mod tests {
 			[(213, 20, 0), (1, 20, 2), (40, 0, 2), (40, 20, u32::MAX), (600, 100, 2)]
 		{
 			let batch = packetizer()
-				.packetize(&frame(data_shards), true, 80, minimum, percentage, 1, &mut 0, 0, 0)
+				.packetize(
+					&frame(data_shards),
+					FrameKind::Key,
+					80,
+					minimum,
+					percentage,
+					1,
+					&mut 0,
+					0,
+					0,
+				)
 				.unwrap();
 			for block in blocks(&batch) {
 				let (data, parity) = counts(block[0]);
@@ -535,6 +562,19 @@ mod tests {
 				);
 				assert!(parity > 0, "{data_shards} data packets, minimum {minimum}");
 			}
+		}
+	}
+
+	#[test]
+	fn frame_header_carries_the_frame_kind() {
+		// moonlight-common-c reads the frame header's fourth byte; a client waiting after a reference
+		// frame invalidation drops every frame until one says key (2) or recovery (5).
+		for (kind, wire) in [(FrameKind::Predicted, 1), (FrameKind::Key, 2), (FrameKind::Recovery, 5)] {
+			let batch = packetizer()
+				.packetize(&frame(3), kind, 80, 2, 20, 1, &mut 0, 0, 0)
+				.unwrap();
+			let first_packet = blocks(&batch)[0][0];
+			assert_eq!(first_packet[PAYLOAD_OFFSET + 3], wire, "{kind:?}");
 		}
 	}
 }

@@ -23,7 +23,7 @@ use crate::session::compositor::frame::{FrameColorSpace, HdrMetadata, HdrModeSta
 use crate::session::manager::SessionShutdownReason;
 use crate::session::stream::StartWaiter;
 
-use crate::session::stream::video::packetizer::Packetizer;
+use crate::session::stream::video::packetizer::{FrameKind, Packetizer};
 use crate::session::stream::video::shard_batch::ShardBatch;
 use crate::session::stream::video::{
 	FrameStats, RtpClock, VideoChromaSampling, VideoDynamicRange, VideoFormat, VideoStreamConfig, VideoStreamContext,
@@ -257,6 +257,9 @@ struct FrameContext {
 	inject_hdr: bool,
 	/// HDR mastering metadata to inject, if any.
 	hdr_metadata: Option<HdrMetadata>,
+	/// The first frame submitted after a reference frame invalidation: unless the
+	/// encoder fell back to a key frame, it is the client's recovery frame.
+	recovery: bool,
 }
 
 /// Message from the encoding thread to the packet consumer thread, in
@@ -423,12 +426,22 @@ async fn run_packet_consumer(
 			.map(|stats| std::time::Duration::from_nanos(stats.wall_latency_ns));
 		let encoded_bytes = packet.data.len();
 		let is_key_frame = packet.is_key_frame;
+		let kind = if is_key_frame {
+			FrameKind::Key
+		} else if frame_context.recovery {
+			FrameKind::Recovery
+		} else {
+			FrameKind::Predicted
+		};
 
 		// Clients take the RTP timestamp (90 kHz) as the frame's presentation time. A re-encoded
 		// frame is stamped when it is encoded, which can be later than the capture time of a frame
 		// still in the queue.
 		let rtp_timestamp = rtp_clock.ticks(frame_context.created_at, &mut next_rtp_ticks) as u32;
 		frame_number += 1;
+		if kind != FrameKind::Predicted {
+			tracing::debug!("Frame {frame_number}: {kind:?} ({encoded_bytes} bytes)");
+		}
 
 		let t_start = std::time::Instant::now();
 		// Capture-to-packetization latency in 100µs units, clamped to u16::MAX
@@ -439,7 +452,7 @@ async fn run_packet_consumer(
 
 		let shards = match packetizer.packetize(
 			&packet.data,
-			is_key_frame,
+			kind,
 			ctx.packet_size,
 			ctx.minimum_fec_packets,
 			config.fec_percentage,
@@ -845,6 +858,9 @@ impl VideoPipelineInner {
 		// worst over-invalidates into a (safe) IDR.
 		let mut submitted_count: u64 = 0;
 		let mut frame_number_base: u64 = 0;
+		// Set by a reference frame invalidation and taken by the next submitted
+		// frame, which the client must see as a recovery frame to stop dropping.
+		let mut recovery_pending = false;
 
 		// Track the last HDR mode state sent to the control stream.
 		let mut last_hdr_state = HdrModeState {
@@ -923,6 +939,7 @@ impl VideoPipelineInner {
 							"Reference frame invalidation requested from client frame {first} (display order {first_display_order})"
 						);
 						encoder.invalidate_reference_frames(first_display_order);
+						recovery_pending = true;
 					},
 					Err(broadcast::error::TryRecvError::Lagged(n)) => {
 						// Missed some loss reports; force an IDR to be safe.
@@ -960,6 +977,7 @@ impl VideoPipelineInner {
 									submitted_at,
 									inject_hdr,
 									hdr_metadata: last_hdr_state.metadata,
+									recovery: std::mem::take(&mut recovery_pending),
 								};
 								// Count this frame in flight; released when the network sender takes
 								// it or the consumer drops it.
@@ -1243,6 +1261,7 @@ impl VideoPipelineInner {
 							submitted_at: t4_encoded,
 							inject_hdr,
 							hdr_metadata: last_hdr_state.metadata,
+							recovery: std::mem::take(&mut recovery_pending),
 						};
 						// Count this frame in flight; released when the network sender takes
 						// it or the consumer drops it.

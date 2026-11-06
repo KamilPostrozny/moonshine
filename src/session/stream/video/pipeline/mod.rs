@@ -678,6 +678,8 @@ impl VideoPipelineInner {
 				return;
 			},
 		};
+		// Every per-frame thread exists now, the encoder's readback included.
+		super::realtime::promote_stream_threads();
 
 		// Start the capture and encoding loop.
 		if let Err(e) = self.run_encoding_loop(

@@ -15,6 +15,7 @@ use crate::session::stream::{StartSignal, StartWaiter};
 mod gso_socket;
 mod packetizer;
 mod pipeline;
+mod realtime;
 mod shard_batch;
 use gso_socket::UdpGsoSocket;
 pub(crate) use pipeline::KcmpProbe;

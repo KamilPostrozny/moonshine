@@ -35,6 +35,7 @@ moonshine-bench [OPTIONS] <COMMAND>
 | `--warmup <N>` | `4` | Seconds to discard before recording stats |
 | `--hdr` | off | Enable HDR mode |
 | `--verbose` | off | Print per-frame stats instead of periodic summary |
+| `--sessions <N>` | off | Run N sessions back to back, then check that ending them left nothing behind (see below); `--duration` defaults to 5 |
 
 ### Examples
 
@@ -73,6 +74,14 @@ Filter logs via `MOONSHINE_LOG`:
 ```bash
 MOONSHINE_LOG=debug moonshine-bench --duration 10 /usr/bin/vkcube
 ```
+
+Check that ended sessions release everything they started:
+
+```bash
+MOONSHINE_INSTANCE=bench moonshine-bench --sessions 3 --duration 4 --warmup 1 -- /usr/bin/vkcube --wsi xcb
+```
+
+After the last session it compares the process with what it held before the first: no `Xwayland` child, listening Wayland or X11 socket, Wayland or X11 display lock, or real-time thread may remain, and the VRAM held by Moonshine and its children (an `Xwayland` holds its own) must be back to its level before the first session. It waits up to 5 seconds for that, then exits with an error listing each leftover. `MOONSHINE_INSTANCE` gives the bench its own Game unit and audio server beside a running Moonshine, and the bench streams on a free local video port.
 
 ### Output
 

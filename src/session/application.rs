@@ -932,7 +932,11 @@ mod tests {
 			let envs = make_envs(&test_context(), &env).unwrap();
 
 			assert_eq!(effective(&envs, "vblank_mode"), None, "FERRISCOPE_WSI_HOLD={value}");
-			assert_eq!(effective(&envs, "__GL_SYNC_TO_VBLANK"), None, "FERRISCOPE_WSI_HOLD={value}");
+			assert_eq!(
+				effective(&envs, "__GL_SYNC_TO_VBLANK"),
+				None,
+				"FERRISCOPE_WSI_HOLD={value}"
+			);
 		}
 	}
 

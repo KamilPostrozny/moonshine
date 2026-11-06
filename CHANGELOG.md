@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Pin ferriscope at `4b52cc2`: a correction queued for one second or longer (a stalled compositor) is dropped instead of installed as fresh, and a Steam FPS cap at the session rate no longer skips a callback when the grid is steered earlier.
 - Strip the encoder's filler (H.264/HEVC filler NAL units, AV1 padding OBUs) before packetizing: RADV pads every CBR frame to the bitrate budget, which only cost Wi-Fi airtime. The one-frame VBV is rounded up to a whole frame (9 ms at 120 fps, not 8).
 - The colour conversion and the encode are chained on the GPU (`convert_async` + `encode_after`): the encode is submitted while the conversion runs instead of after the CPU saw it finish. The frame still goes back to the compositor only once the conversion has read it.
+- Pin ferriscope at `b5bbe42`: a Steam FPS cap counts session ticks instead of wall time, so steering the frame clock doesn't change it and a cap just under the session rate (118 fps on 120 Hz) is enforced; `frame_ready` goes to a MAILBOX or IMMEDIATE swapchain only when it was bound at protocol version 2.
 
 ## [v0.16.1] - 13-09-2026
 

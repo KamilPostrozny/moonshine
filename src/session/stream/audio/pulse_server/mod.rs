@@ -3,7 +3,6 @@ mod commands;
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read, Write};
 use std::os::unix::io::AsRawFd;
-use std::path::PathBuf;
 use std::time;
 
 use async_shutdown::ShutdownManager;
@@ -28,6 +27,15 @@ const MAX_OUTGOING_BUFFER: usize = 64 * 1024 * 1024;
 /// Clock tick rate. Determines audio frame size sent to the encoder.
 /// For 5ms frames: 200 Hz; for 10ms frames: 100 Hz.
 pub(crate) const DEFAULT_CLOCK_RATE_HZ: u32 = 200;
+
+/// Most clock periods mixed for one wakeup. A wakeup that comes several periods late
+/// mixes each period it missed, so the stream has no hole; past this many, the rest are
+/// skipped rather than sent as a burst the client would have to drop.
+const MAX_CATCH_UP_TICKS: u64 = 4;
+
+/// Capacity of the queue of mixed frames to the encoder: room for one late wakeup's
+/// catch-up while the encoder is busy.
+pub(crate) const FRAME_QUEUE_LEN: usize = MAX_CATCH_UP_TICKS as usize;
 
 const SINK_NAME: &str = "moonshine";
 
@@ -72,6 +80,28 @@ struct PlaybackStream {
 	write_offset: u64,
 	read_offset: u64,
 	opened_at: time::Instant,
+	queue: QueueStats,
+}
+
+/// Seconds between a playback stream's queue reports.
+const QUEUE_REPORT_SECS: u32 = 5;
+
+/// What a playing stream had queued at each clock period since its last report: the
+/// audio the Host holds before mixing, which is most of its audio latency.
+#[derive(Default)]
+pub(crate) struct QueueStats {
+	pub periods: u32,
+	pub queued_sum: u64,
+	pub queued_max: usize,
+	pub underruns: u32,
+}
+
+impl QueueStats {
+	fn record(&mut self, queued: usize) {
+		self.periods += 1;
+		self.queued_sum += queued as u64;
+		self.queued_max = self.queued_max.max(queued);
+	}
 }
 
 struct Client {
@@ -159,6 +189,8 @@ struct ServerState {
 	sink_volume: Vec<f32>,
 	sink_muted: bool,
 	sink_spec: SinkSpec,
+	/// Target length a playback stream gets when its client leaves it unset.
+	default_target_length_ms: u32,
 }
 
 pub(crate) struct PulseServer {
@@ -171,6 +203,7 @@ pub(crate) struct PulseServer {
 	spare_frame: Option<AudioFrame>,
 
 	clients: BTreeMap<mio::Token, Client>,
+	next_client_token: usize,
 	server_state: ServerState,
 
 	epoch: time::Instant,
@@ -199,15 +232,18 @@ fn pop_missing(missing: &mut i64, requested: &mut usize, min_req: usize, in_preb
 }
 
 impl PulseServer {
-	pub fn spawn(
+	/// Binds the server to `listener` and arms its clock; [`PulseServer::spawn`] runs it.
+	///
+	/// `default_target_length_ms` is the buffer a playback stream gets when its client
+	/// doesn't ask for one.
+	pub fn new(
 		listener: std::os::unix::net::UnixListener,
-		_socket_path: PathBuf,
 		sink_channels: AudioChannels,
 		packet_duration_ms: u32,
+		default_target_length_ms: u32,
 		frame_tx: crossbeam_channel::Sender<AudioFrame>,
 		frame_recycle_rx: crossbeam_channel::Receiver<AudioFrame>,
-		stop: ShutdownManager<SessionShutdownReason>,
-	) -> Result<(), Error> {
+	) -> Result<Self, Error> {
 		listener.set_nonblocking(true)?;
 		let listener = UnixListener::from_std(listener);
 		let poll = mio::Poll::new()?;
@@ -272,7 +308,7 @@ impl PulseServer {
 
 		dummy_sink.formats[0] = default_format_info.clone();
 
-		let server = Self {
+		Ok(Self {
 			listener,
 			poll,
 			clock,
@@ -280,6 +316,7 @@ impl PulseServer {
 			frame_recycle_rx,
 			spare_frame: None,
 			clients: BTreeMap::new(),
+			next_client_token: 1024,
 			server_state: ServerState {
 				server_info,
 				clock_rate_hz,
@@ -290,27 +327,27 @@ impl PulseServer {
 				sink_volume: vec![1.0; sink_channels as usize],
 				sink_muted: false,
 				sink_spec,
+				default_target_length_ms,
 			},
 			epoch: time::Instant::now(),
-		};
+		})
+	}
 
+	/// Runs the server on its own `pulse-server` thread until `stop` triggers.
+	pub fn spawn(self, stop: ShutdownManager<SessionShutdownReason>) {
 		std::thread::Builder::new()
 			.name("pulse-server".to_string())
 			.spawn(move || {
 				let _ = crate::session::realtime::register_current("pulse-server");
-				if let Err(e) = server.run(stop.clone()) {
+				if let Err(e) = self.run(stop.clone()) {
 					tracing::error!("PulseServer error: {e}");
 					let _ = stop.trigger_shutdown(SessionShutdownReason::PulseServerStopped);
 				}
 			})
 			.expect("Failed to spawn pulse server thread");
-
-		Ok(())
 	}
 
 	fn run(mut self, stop: ShutdownManager<SessionShutdownReason>) -> Result<(), Error> {
-		let mut next_client_token = 1024u64;
-
 		self.poll.registry().register(
 			&mut mio::unix::SourceFd(&self.clock.as_raw_fd()),
 			CLOCK,
@@ -339,40 +376,18 @@ impl PulseServer {
 						// A wakeup can race its own drain and find no expirations
 						// left to read (EAGAIN); skip the tick, don't kill the session.
 						match self.clock.read() {
-							Ok(_) => self.clock_tick()?,
+							Ok(expirations) => self.clock_expired(expirations)?,
 							Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
 							Err(e) => return Err(e.into()),
 						}
 					},
 					LISTENER => loop {
-						let (mut socket, _) = match self.listener.accept() {
-							Ok(conn) => conn,
+						let socket = match self.listener.accept() {
+							Ok((socket, _)) => socket,
 							Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
 							Err(e) => return Err(e.into()),
 						};
-						let id = next_client_token as u32;
-						let token = mio::Token(next_client_token as usize);
-						next_client_token += 1;
-
-						tracing::debug!("PulseAudio client connected (id={})", id);
-
-						self.poll
-							.registry()
-							.register(&mut socket, token, mio::Interest::READABLE)?;
-
-						self.clients.insert(
-							token,
-							Client {
-								id,
-								socket,
-								protocol_version: pulse::MAX_VERSION,
-								props: None,
-								incoming: BytesMut::new(),
-								outgoing: BytesMut::new(),
-								writable_registered: false,
-								playback_streams: BTreeMap::new(),
-							},
-						);
+						self.add_client(socket)?;
 					},
 					client_token if event.is_read_closed() => {
 						self.remove_client(client_token);
@@ -390,6 +405,48 @@ impl PulseServer {
 				}
 			}
 		}
+	}
+
+	fn add_client(&mut self, mut socket: mio::net::UnixStream) -> Result<mio::Token, Error> {
+		let id = self.next_client_token as u32;
+		let token = mio::Token(self.next_client_token);
+		self.next_client_token += 1;
+
+		tracing::debug!("PulseAudio client connected (id={})", id);
+
+		self.poll
+			.registry()
+			.register(&mut socket, token, mio::Interest::READABLE)?;
+
+		self.clients.insert(
+			token,
+			Client {
+				id,
+				socket,
+				protocol_version: pulse::MAX_VERSION,
+				props: None,
+				incoming: BytesMut::new(),
+				outgoing: BytesMut::new(),
+				writable_registered: false,
+				playback_streams: BTreeMap::new(),
+			},
+		);
+		Ok(token)
+	}
+
+	/// Mixes one period per clock expiration since the last wakeup, at most
+	/// [`MAX_CATCH_UP_TICKS`].
+	fn clock_expired(&mut self, expirations: u64) -> Result<(), Error> {
+		if expirations > MAX_CATCH_UP_TICKS {
+			tracing::debug!(
+				"Audio clock: {expirations} periods since the last wakeup, mixing {MAX_CATCH_UP_TICKS} and skipping {}.",
+				expirations - MAX_CATCH_UP_TICKS
+			);
+		}
+		for _ in 0..expirations.min(MAX_CATCH_UP_TICKS) {
+			self.clock_tick()?;
+		}
+		Ok(())
 	}
 
 	fn recv(&mut self, client_token: mio::Token) -> Result<(), Error> {
@@ -572,6 +629,7 @@ impl PulseServer {
 				// Prebuffering and Corked streams do not drain.
 				if matches!(stream.state, StreamState::Playing | StreamState::Draining(_)) {
 					let buffer_len = stream.buffer.len_bytes();
+					stream.queue.record(buffer_len);
 
 					let drained = if stream.muted {
 						stream.buffer.drain_and_mix(
@@ -588,6 +646,7 @@ impl PulseServer {
 					if !drained {
 						// Buffer underrun: notify client and (re-)enter prebuffering.
 						tracing::warn!("Buffer underrun for stream {}", id);
+						stream.queue.underruns += 1;
 						pulse::write_command_message(
 							&mut ClientWriter(&mut client.outgoing),
 							u32::MAX,
@@ -599,11 +658,14 @@ impl PulseServer {
 						)?;
 
 						if stream.buffer_attr.pre_buffering > 0 && matches!(stream.state, StreamState::Playing) {
+							// Playback restarts after one pre-buffering's worth, but the
+							// REQUEST asks for the whole target, so the queue refills to it.
+							// Seeding missing makes pop_missing fire in the REQUEST phase
+							// below (same tick, no one-tick delay). Reset requested — any
+							// stale in-flight credit is discarded.
 							stream.state = StreamState::Prebuffering(stream.buffer_attr.pre_buffering as u64);
-							// Seed missing = pre_buffering so pop_missing fires immediately
-							// in the REQUEST phase below (same tick, no one-tick delay).
-							// Reset requested — any stale in-flight credit is discarded.
-							stream.missing = stream.buffer_attr.pre_buffering as i64;
+							stream.missing = (stream.buffer_attr.target_length as usize)
+								.saturating_sub(stream.buffer.len_bytes()) as i64;
 							stream.requested = 0;
 						}
 						// Fall through to REQUEST phase — do NOT continue.
@@ -619,6 +681,16 @@ impl PulseServer {
 							done_draining.push(*id);
 						}
 					}
+				}
+
+				if stream.queue.periods >= QUEUE_REPORT_SECS * self.server_state.clock_rate_hz {
+					let owner = log::StreamOwner {
+						client_id: client.id,
+						client_props: client.props.as_ref(),
+						channel: *id,
+					};
+					log::pulse_stream_queue(owner, stream.buffer.stream_spec(), &stream.queue);
+					stream.queue = QueueStats::default();
 				}
 
 				// ── Request phase ────────────────────────────────────────────────────
@@ -683,5 +755,244 @@ impl PulseServer {
 		}
 
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::io::{Cursor, Read, Write};
+	use std::os::unix::net::UnixStream;
+
+	use pulseaudio::protocol::{self as pulse};
+
+	use super::*;
+
+	/// Bytes in one millisecond of the tests' streams: f32 stereo at 48 kHz.
+	const MS: u32 = 48 * 2 * 4;
+
+	/// One Pulse client connected to a server that isn't running its own thread, so the test
+	/// feeds it commands, audio and clock expirations by hand.
+	struct Harness {
+		server: PulseServer,
+		token: mio::Token,
+		peer: UnixStream,
+		frames: crossbeam_channel::Receiver<AudioFrame>,
+		_recycle: crossbeam_channel::Sender<AudioFrame>,
+		_dir: tempfile::TempDir,
+		seq: u32,
+	}
+
+	impl Harness {
+		fn new(default_target_length_ms: u32) -> Self {
+			let dir = tempfile::tempdir().unwrap();
+			let listener = std::os::unix::net::UnixListener::bind(dir.path().join("native")).unwrap();
+			let (frame_tx, frames) = crossbeam_channel::bounded(FRAME_QUEUE_LEN);
+			let (recycle, recycle_rx) = crossbeam_channel::bounded(FRAME_QUEUE_LEN);
+			let mut server = PulseServer::new(
+				listener,
+				AudioChannels::Stereo,
+				5,
+				default_target_length_ms,
+				frame_tx,
+				recycle_rx,
+			)
+			.unwrap();
+			let (ours, peer) = UnixStream::pair().unwrap();
+			ours.set_nonblocking(true).unwrap();
+			peer.set_nonblocking(true).unwrap();
+			let token = server.add_client(mio::net::UnixStream::from_std(ours)).unwrap();
+			Self {
+				server,
+				token,
+				peer,
+				frames,
+				_recycle: recycle,
+				_dir: dir,
+				seq: 0,
+			}
+		}
+
+		/// Every message the server has sent since the last call, descriptor included.
+		fn received(&mut self) -> Vec<Vec<u8>> {
+			let mut bytes = Vec::new();
+			let mut chunk = [0u8; 4096];
+			loop {
+				match self.peer.read(&mut chunk) {
+					Ok(0) => break,
+					Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+					Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+					Err(e) => panic!("reading from the server: {e}"),
+				}
+			}
+			let mut messages = Vec::new();
+			let mut rest = &bytes[..];
+			while !rest.is_empty() {
+				let desc = pulse::read_descriptor(&mut Cursor::new(rest)).unwrap();
+				let len = pulse::DESCRIPTOR_SIZE + desc.length as usize;
+				messages.push(rest[..len].to_vec());
+				rest = &rest[len..];
+			}
+			messages
+		}
+
+		/// The commands (not replies) the server has sent since the last call.
+		fn events(&mut self) -> Vec<pulse::Command> {
+			self.received()
+				.iter()
+				.map(|m| {
+					pulse::read_command_message(&mut Cursor::new(&m[..]), pulse::MAX_VERSION)
+						.unwrap()
+						.1
+				})
+				.collect()
+		}
+
+		fn create_stream(&mut self, buffer_attr: pulse::stream::BufferAttr) -> pulse::CreatePlaybackStreamReply {
+			self.seq += 1;
+			let params = pulse::PlaybackStreamParams {
+				sample_spec: pulse::SampleSpec {
+					format: pulse::SampleFormat::Float32Le,
+					channels: 2,
+					sample_rate: 48_000,
+				},
+				channel_map: pulse::ChannelMap::stereo(),
+				sink_name: Some(c"moonshine".into()),
+				buffer_attr,
+				cvolume: Some(pulse::ChannelVolume::norm(2)),
+				..Default::default()
+			};
+			pulse::write_command_message(
+				&mut self.peer,
+				self.seq,
+				&pulse::Command::CreatePlaybackStream(params),
+				pulse::MAX_VERSION,
+			)
+			.unwrap();
+			self.server.recv(self.token).unwrap();
+			let messages = self.received();
+			assert_eq!(messages.len(), 1, "one reply and nothing else");
+			let (seq, reply) = pulse::read_reply_message::<pulse::CreatePlaybackStreamReply>(
+				&mut Cursor::new(&messages[0][..]),
+				pulse::MAX_VERSION,
+			)
+			.unwrap();
+			assert_eq!(seq, self.seq);
+			reply
+		}
+
+		/// Writes `ms` milliseconds of a constant `sample` to the stream on `channel`.
+		fn write_audio(&mut self, channel: u32, ms: u32, sample: f32) {
+			let payload: Vec<u8> = (0..ms * MS / 4).flat_map(|_| sample.to_le_bytes()).collect();
+			let desc = pulse::Descriptor {
+				length: payload.len() as u32,
+				channel,
+				offset: 0,
+				flags: pulse::DescriptorFlags::empty(),
+			};
+			pulse::write_descriptor(&mut self.peer, &desc).unwrap();
+			self.peer.write_all(&payload).unwrap();
+			self.server.recv(self.token).unwrap();
+		}
+
+		fn frames(&self) -> Vec<AudioFrame> {
+			self.frames.try_iter().collect()
+		}
+	}
+
+	fn attr(target_ms: Option<u32>, pre_buffering_ms: Option<u32>) -> pulse::stream::BufferAttr {
+		pulse::stream::BufferAttr {
+			target_length: target_ms.map_or(u32::MAX, |ms| ms * MS),
+			pre_buffering: pre_buffering_ms.map_or(u32::MAX, |ms| ms * MS),
+			..Default::default()
+		}
+	}
+
+	#[test]
+	fn a_20_ms_target_is_honoured() {
+		let mut pulse = Harness::new(20);
+		let reply = pulse.create_stream(attr(Some(20), None));
+		assert_eq!(reply.buffer_attr.target_length, 20 * MS);
+		assert_eq!(reply.requested_bytes, 20 * MS, "the first request fills the target");
+
+		let reply = pulse.create_stream(attr(Some(40), None));
+		assert_eq!(reply.buffer_attr.target_length, 40 * MS);
+	}
+
+	#[test]
+	fn a_target_below_two_minimum_requests_gets_two() {
+		let mut pulse = Harness::new(20);
+		let reply = pulse.create_stream(attr(Some(3), None));
+		assert_eq!(reply.buffer_attr.minimum_request_length, 5 * MS);
+		assert_eq!(reply.buffer_attr.target_length, 10 * MS);
+	}
+
+	#[test]
+	fn an_unset_target_gets_the_configured_default() {
+		let reply = Harness::new(20).create_stream(attr(None, None));
+		assert_eq!(reply.buffer_attr.target_length, 20 * MS);
+
+		let reply = Harness::new(30).create_stream(attr(None, None));
+		assert_eq!(reply.buffer_attr.target_length, 30 * MS);
+	}
+
+	#[test]
+	fn pre_buffering_is_one_minimum_request() {
+		let mut pulse = Harness::new(20);
+		let reply = pulse.create_stream(attr(Some(20), Some(20)));
+		assert_eq!(reply.buffer_attr.pre_buffering, 5 * MS);
+		let reply = pulse.create_stream(attr(Some(20), None));
+		assert_eq!(reply.buffer_attr.pre_buffering, 5 * MS);
+		let channel = reply.channel;
+
+		// One period of audio starts playback.
+		pulse.write_audio(channel, 5, 0.5);
+		assert_eq!(pulse.events(), vec![pulse::Command::Started(channel)]);
+
+		// It plays, then the stream runs dry, and the server asks for the whole target again.
+		pulse.server.clock_expired(1).unwrap();
+		pulse.server.clock_expired(1).unwrap();
+		let events = pulse.events();
+		assert!(
+			events
+				.iter()
+				.any(|e| matches!(e, pulse::Command::Underflow(u) if u.channel == channel))
+		);
+		assert_eq!(
+			events.last(),
+			Some(&pulse::Command::Request(pulse::Request {
+				channel,
+				length: 20 * MS
+			}))
+		);
+
+		// One period re-primes it.
+		pulse.write_audio(channel, 5, 0.5);
+		assert_eq!(pulse.events(), vec![pulse::Command::Started(channel)]);
+	}
+
+	#[test]
+	fn three_missed_ticks_produce_three_frames() {
+		let mut pulse = Harness::new(20);
+		let channel = pulse.create_stream(attr(Some(20), None)).channel;
+		pulse.write_audio(channel, 15, 0.5);
+
+		pulse.server.clock_expired(3).unwrap();
+
+		let frames = pulse.frames();
+		assert_eq!(frames.len(), 3);
+		for frame in &frames {
+			assert_eq!(frame.buf.len(), 240 * 2);
+			assert!(
+				frame.buf.iter().all(|&s| s == 0.5),
+				"each frame carries its own period of the stream"
+			);
+		}
+	}
+
+	#[test]
+	fn catching_up_is_capped_at_four_ticks() {
+		let mut pulse = Harness::new(20);
+		pulse.server.clock_expired(10).unwrap();
+		assert_eq!(pulse.frames().len(), 4);
 	}
 }

@@ -1,7 +1,11 @@
-//! Waiting for the compositor's acquire fence before reading a frame.
+//! Waiting for the compositor's acquire fence before reading a frame, and for
+//! GPU work before releasing what it reads.
 
 use std::os::fd::RawFd;
 use std::time::{Duration, Instant};
+
+use ash::vk;
+use pixelforge::TimelinePoint;
 
 /// How long the pipeline waits for the compositor's acquire fence. A frame whose
 /// render has not finished after this is a stuck GPU, not a slow frame.
@@ -33,6 +37,19 @@ pub(super) fn wait_sync_file(fd: RawFd, timeout: Duration) -> Result<(), String>
 			},
 		}
 	}
+}
+
+/// Wait until the GPU reaches `point`, for at most `timeout`.
+pub(super) fn wait_timeline_point(
+	device: &ash::Device,
+	point: TimelinePoint,
+	timeout: Duration,
+) -> Result<(), vk::Result> {
+	let semaphores = [point.semaphore];
+	let values = [point.value];
+	let info = vk::SemaphoreWaitInfo::default().semaphores(&semaphores).values(&values);
+	// SAFETY: pixelforge keeps the point's timeline semaphore alive as long as its context.
+	unsafe { device.wait_semaphores(&info, timeout.as_nanos().min(u128::from(u64::MAX)) as u64) }
 }
 
 #[cfg(test)]

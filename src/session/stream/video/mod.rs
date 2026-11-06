@@ -128,7 +128,8 @@ pub struct FrameStats {
 	pub channel_wait: std::time::Duration,
 	/// Time spent importing the DMA-BUF into Vulkan.
 	pub import: std::time::Duration,
-	/// Time spent on GPU color conversion.
+	/// Time spent recording and submitting the GPU color conversion. The encode
+	/// waits for the conversion on the GPU, so this excludes the conversion itself.
 	pub convert: std::time::Duration,
 	/// Time spent submitting the frame to the asynchronous encoder.
 	pub submit: std::time::Duration,

@@ -1176,19 +1176,19 @@ impl VideoPipelineInner {
 				// Retain the source image; the converter caches a view of it.
 				*cached_source = Some(Arc::clone(&source_import));
 
-				// Convert to YUV.
-				if let Err(e) = converter.convert(source_image, src_layout, encoder.input_image()) {
-					if is_device_lost(&e) {
-						return Err(format!("GPU color conversion failed: {e}"));
-					}
-					tracing::warn!("GPU color conversion failed: {e}");
-					continue;
-				}
-
-				// The DMA-BUF content has been read into the encoder's input
-				// image: dropping the frame returns its buffer to the compositor.
+				// Convert to YUV. The encode below waits for the conversion on the
+				// GPU, so its submit doesn't wait for it on the CPU first.
+				let converted = match converter.convert_async(source_image, src_layout, encoder.input_image(), &[]) {
+					Ok(converted) => converted,
+					Err(e) => {
+						if is_device_lost(&e) {
+							return Err(format!("GPU color conversion failed: {e}"));
+						}
+						tracing::warn!("GPU color conversion failed: {e}");
+						continue;
+					},
+				};
 				let frame_hdr_metadata = hdr_metadata(&frame.info.colour);
-				drop(frame);
 
 				// Forward HDR mode state changes to the control stream.
 				// In HDR sessions, `enabled` reflects whether the current
@@ -1219,12 +1219,23 @@ impl VideoPipelineInner {
 
 				let t3_converted = std::time::Instant::now();
 
-				// Encode the converted image. This is asynchronous: it submits the
-				// frame without blocking; the encoded packet is produced by the
-				// readback thread and handled by the consumer thread.
-				let encode_result = encoder.encode(encoder.input_image());
+				// Encode the converted image once the conversion is done. This is
+				// asynchronous: it submits the frame without blocking; the encoded
+				// packet is produced by the readback thread and handled by the
+				// consumer thread.
+				let encode_result = encoder.encode_after(encoder.input_image(), &[converted]);
 
 				let t4_encoded = std::time::Instant::now();
+
+				// The conversion reads the DMA-BUF until it is done: only then may
+				// dropping the frame return its buffer to the compositor.
+				if let Err(e) = fence::wait_timeline_point(context.device(), converted, fence::FENCE_TIMEOUT) {
+					if e == vk::Result::ERROR_DEVICE_LOST {
+						return Err(format!("GPU color conversion failed: {e}"));
+					}
+					tracing::warn!("Waiting for the color conversion failed: {e}");
+				}
+				drop(frame);
 
 				match encode_result {
 					Ok(future) => {

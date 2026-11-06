@@ -567,6 +567,7 @@ async fn run_control_loop(
 				capture_epoch_sent = false;
 				latency_client_ready = false;
 				last_clock_report = None;
+				frame_clock.new_client();
 			},
 			Ok(Some(Event::Disconnect { peer_id, .. })) => {
 				if connected_peer == Some(peer_id) {

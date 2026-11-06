@@ -243,6 +243,12 @@ impl SessionManager {
 				// audio, and control streams are still running and re-learn the client's
 				// address from its PINGs (with refreshed keys via `/resume`), so there is
 				// nothing to rebuild — accept the re-ANNOUNCE without storing new contexts.
+				//
+				// The latency protocol stays as the session's first ANNOUNCE negotiated it.
+				// That is safe both ways: the Host sends latency messages only in reply to a
+				// client's clock-sync request, which a client that didn't offer the protocol
+				// never sends; and a client that offers it to a session that didn't negotiate
+				// it gets no replies, so its frame clock is never steered.
 				tracing::info!("Resuming active session: accepting RTSP ANNOUNCE from reconnecting client.");
 				Ok(())
 			},

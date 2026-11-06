@@ -646,7 +646,10 @@ async fn run_benchmark(
 			port: video_port,
 			..VideoStreamConfig::default()
 		},
-		AudioStreamConfig { port: 0 },
+		AudioStreamConfig {
+			port: 0,
+			..Default::default()
+		},
 		ControlStreamConfig {
 			port: 0,
 			..Default::default()

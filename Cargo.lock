@@ -1307,14 +1307,11 @@ name = "fec-rs"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a86d2bb0db9647ee5dece2ea54a808c14428db009ad751f95b091598835cd0b"
-dependencies = [
- "rayon",
-]
 
 [[package]]
 name = "ferriscope"
 version = "0.1.0"
-source = "git+https://github.com/KamilPostrozny/ferriscope?rev=a3e118ee69d584fe90ba35c92de6badea33eadd6#a3e118ee69d584fe90ba35c92de6badea33eadd6"
+source = "git+https://github.com/KamilPostrozny/ferriscope?rev=df8e2daeec317b1b0b623e15adc08769af5e8402#df8e2daeec317b1b0b623e15adc08769af5e8402"
 dependencies = [
  "bitflags",
  "smithay",
@@ -2758,7 +2755,7 @@ dependencies = [
 [[package]]
 name = "pixelforge"
 version = "0.10.0"
-source = "git+https://github.com/KamilPostrozny/pixelforge?rev=06942afa0d5be0c25a5683e2dd2eb5f2c46ad257#06942afa0d5be0c25a5683e2dd2eb5f2c46ad257"
+source = "git+https://github.com/KamilPostrozny/pixelforge?rev=9d0729a8d44529c6748602651d971f6c3657e387#9d0729a8d44529c6748602651d971f6c3657e387"
 dependencies = [
  "ash 0.38.0+1.4.352",
  "futures-channel",
@@ -3895,7 +3892,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
@@ -4039,8 +4036,7 @@ dependencies = [
 [[package]]
 name = "tokio-enet"
 version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ede1e4e6d38df6dcd4891668f532905c6b19640caa142128a6957849cafea3d6"
+source = "git+https://github.com/KamilPostrozny/tokio-enet?rev=9c0107ebe5a4c76292e97c2d85ada0c814e70e87#9c0107ebe5a4c76292e97c2d85ada0c814e70e87"
 dependencies = [
  "socket2",
  "thiserror 2.0.19",

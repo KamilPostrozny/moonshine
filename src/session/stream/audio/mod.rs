@@ -16,7 +16,7 @@ use crate::session::manager::SessionShutdownReason;
 use crate::session::stream::{StartSignal, StartWaiter};
 
 use self::encoder::AudioEncoder;
-use self::pulse_server::PulseServer;
+use self::pulse_server::{FRAME_QUEUE_LEN, PulseServer};
 
 mod buffer;
 mod encoder;
@@ -29,11 +29,21 @@ mod pulse_server;
 pub struct AudioStreamConfig {
 	/// Port to use for streaming audio data.
 	pub port: u16,
+
+	/// Buffer, in milliseconds, that the built-in Pulse server keeps for a Game's
+	/// playback stream when the Game doesn't ask for a size. A Game that asks gets
+	/// what it asks for, down to 10 ms (two 5 ms requests). Larger values ride out
+	/// longer stalls in the Game's audio thread, at the cost of that much more
+	/// audio latency.
+	pub default_target_length_ms: u32,
 }
 
 impl Default for AudioStreamConfig {
 	fn default() -> Self {
-		Self { port: 48000 }
+		Self {
+			port: 48000,
+			default_target_length_ms: 20,
+		}
 	}
 }
 
@@ -289,6 +299,7 @@ pub(crate) struct AudioStream {
 	pulse_socket: UnixListener,
 	pub pulse_socket_path: PathBuf,
 	udp_socket: tokio::net::UdpSocket,
+	default_target_length_ms: u32,
 	stop: ShutdownManager<SessionShutdownReason>,
 }
 
@@ -328,6 +339,7 @@ impl AudioStream {
 			pulse_socket,
 			pulse_socket_path,
 			udp_socket,
+			default_target_length_ms: config.default_target_length_ms,
 			stop,
 		})
 	}
@@ -348,20 +360,20 @@ impl AudioStream {
 		spawn_handle_audio_packets(packet_rx, self.udp_socket, start.waiter(), self.stop.clone());
 
 		// Create frame channels for PulseServer and encoder communication.
-		let (frame_tx, frame_rx) = crossbeam_channel::bounded(3);
-		let (frame_recycle_tx, frame_recycle_rx) = crossbeam_channel::bounded(3);
+		let (frame_tx, frame_rx) = crossbeam_channel::bounded(FRAME_QUEUE_LEN);
+		let (frame_recycle_tx, frame_recycle_rx) = crossbeam_channel::bounded(FRAME_QUEUE_LEN);
 
 		// Spawn PulseServer immediately (no gating — it just mixes audio, no network impact).
-		PulseServer::spawn(
+		PulseServer::new(
 			self.pulse_socket,
-			self.pulse_socket_path.clone(),
 			context.audio_config.channels,
 			context.packet_duration_ms,
+			self.default_target_length_ms,
 			frame_tx,
 			frame_recycle_rx,
-			self.stop.clone(),
 		)
-		.map_err(|e| tracing::error!("Failed to create PulseServer: {e}"))?;
+		.map_err(|e| tracing::error!("Failed to create PulseServer: {e}"))?
+		.spawn(self.stop.clone());
 
 		// Spawn audio encoder — gated behind start.
 		AudioEncoder::spawn(
@@ -455,5 +467,13 @@ mod tests {
 		tokio::time::timeout(std::time::Duration::from_secs(1), packet_tx.closed())
 			.await
 			.expect("packet handler kept its socket after shutdown");
+	}
+
+	#[test]
+	fn the_default_target_length_is_20_ms_and_configurable() {
+		let unset: AudioStreamConfig = toml::from_str("port = 1").unwrap();
+		assert_eq!(unset.default_target_length_ms, 20);
+		let set: AudioStreamConfig = toml::from_str("port = 1\ndefault_target_length_ms = 30").unwrap();
+		assert_eq!(set.default_target_length_ms, 30);
 	}
 }

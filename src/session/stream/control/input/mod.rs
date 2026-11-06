@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 
 use self::gamepad::Gamepad;
 use self::gamepad::GamepadConfig;
+use self::gamepad_queue::{Full, GamepadReceiver, GamepadSender, gamepad_queue};
 use self::remap::{HoldToHome, HoldTransition};
 use self::touch::{Pen, PenToolKind, PointerEventKind, Touch};
 use crate::session::compositor::input::{CompositorInput, scroll};
@@ -24,6 +25,7 @@ use self::{
 use crate::session::stream::control::FeedbackCommand;
 
 pub(crate) mod gamepad;
+mod gamepad_queue;
 mod keyboard;
 mod mouse;
 mod remap;
@@ -136,9 +138,13 @@ impl InputEvent {
 	}
 }
 
+/// How many gamepad events the gamepad thread may fall behind by: every state of 16 pads
+/// (updates, two motion sensors, battery) fits, so a newer state is never refused.
+const GAMEPAD_QUEUE_CAPACITY: usize = 64;
+
 pub(crate) struct InputHandler {
 	compositor: CompositorInput,
-	gamepad_tx: mpsc::Sender<(InputEvent, mpsc::Sender<FeedbackCommand>)>,
+	gamepad_tx: GamepadSender,
 }
 
 impl InputHandler {
@@ -147,7 +153,7 @@ impl InputHandler {
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		gamepad_config: GamepadConfig,
 	) -> Result<Self, ()> {
-		let (gamepad_tx, gamepad_rx) = mpsc::channel(10);
+		let (gamepad_tx, gamepad_rx) = gamepad_queue(GAMEPAD_QUEUE_CAPACITY);
 
 		std::thread::spawn(move || {
 			let rt = tokio::runtime::Builder::new_current_thread()
@@ -168,7 +174,8 @@ impl InputHandler {
 		Ok(Self { compositor, gamepad_tx })
 	}
 
-	async fn handle_input(&self, event: InputEvent, feedback: mpsc::Sender<FeedbackCommand>) -> Result<(), ()> {
+	/// Hand `event` to the compositor seat or the gamepad thread, never waiting for either.
+	fn handle_input(&self, event: InputEvent, feedback: mpsc::Sender<FeedbackCommand>) -> Result<(), ()> {
 		match event {
 			InputEvent::KeyDown(key) => {
 				if let Some(code) = key.to_linux_keycode() {
@@ -239,20 +246,19 @@ impl InputHandler {
 				tracing::trace!("Typing clipboard text.");
 				self.compositor.send(SeatEvent::Text(text));
 			},
-			// Gamepad events: forward to gamepad handler thread.
+			// Gamepad events: queued for the gamepad thread, which creates the devices.
 			gamepad_event => {
 				self.gamepad_tx
-					.send((gamepad_event, feedback))
-					.await
-					.map_err(|e| tracing::warn!("Failed to send gamepad event: {e}"))?;
+					.try_send(gamepad_event, feedback)
+					.map_err(|Full| tracing::warn!("Gamepad queue full: dropped a gamepad event."))?;
 			},
 		}
 		Ok(())
 	}
 
-	pub async fn handle_raw_input(&self, event: &[u8], feedback: mpsc::Sender<FeedbackCommand>) -> Result<(), ()> {
+	pub fn handle_raw_input(&self, event: &[u8], feedback: mpsc::Sender<FeedbackCommand>) -> Result<(), ()> {
 		let event = InputEvent::from_bytes(event)?;
-		self.handle_input(event, feedback).await
+		self.handle_input(event, feedback)
 	}
 }
 
@@ -370,7 +376,7 @@ impl GamepadSlot {
 }
 
 async fn run_gamepad_handler(
-	mut command_rx: mpsc::Receiver<(InputEvent, mpsc::Sender<FeedbackCommand>)>,
+	mut command_rx: GamepadReceiver,
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	gamepad_config: GamepadConfig,
 ) {

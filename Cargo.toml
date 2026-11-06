@@ -37,12 +37,16 @@ clap = { version = "4.6.1", features = ["derive"], optional = true }
 crossbeam-channel = "0.5.15"
 dasp_sample = "0.11.0"
 dirs = "6.0.0"
-fec-rs = { version = "0.1.0", features = ["parallel"] }
+# Without `parallel`: FEC runs on the real-time send thread, not on rayon's pool of
+# normal-priority threads. A frame's ~60 shards take microseconds sequentially.
+fec-rs = "0.1.0"
 # The KamilPostrozny fork's `latency` branch: upstream plus the embedder-steered frame clock
 # (`CompositorHandles::frame_clock`) the latency protocol's corrections drive, and ferriscope's
 # WSI layer holding Games in every present mode (ferriscope_swapchain_v1 version 2), installed
-# for x86_64 and i686, and a session teardown that leaves no Xwayland, socket or lock behind.
-ferriscope = { git = "https://github.com/KamilPostrozny/ferriscope", rev = "a3e118ee69d584fe90ba35c92de6badea33eadd6", default-features = false }
+# for x86_64 and i686, a session teardown that leaves no Xwayland, socket or lock behind, and a
+# frame clock that a new consumer sends back to nominal with no shift pending. Reports the
+# compositor thread's ID (`Compositor::thread_id`) for real-time registration.
+ferriscope = { git = "https://github.com/KamilPostrozny/ferriscope", rev = "df8e2daeec317b1b0b623e15adc08769af5e8402", default-features = false }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 gethostname = "1.1.0"
 hex = "0.4.3"
@@ -65,9 +69,11 @@ pkcs8 = "0.11.0"
 # v0.10.0 plus upstream's reference-window fix (`f046afe`, only on upstream main, which
 # changes the encode API): RADV predicts HEVC/AV1 frames from one reference, and v0.10.0
 # sized the whole window by that, so every reference frame invalidation became an IDR.
-# Also the fork's global queue priority (`VideoContextBuilder::highest_queue_priority`), and
-# upstream's `Encoder::repeat` (`3dfc229`), backported, for the idle keyframe.
-pixelforge = { git = "https://github.com/KamilPostrozny/pixelforge", rev = "06942afa0d5be0c25a5683e2dd2eb5f2c46ad257", features = ["dmabuf"] }
+# Also the fork's global queue priority (`VideoContextBuilder::highest_queue_priority`), its
+# bitstream readback from cached host memory, its readback thread's ID
+# (`Encoder::readback_thread_id`) for real-time registration, and upstream's
+# `Encoder::repeat` (`3dfc229`), backported, for the idle keyframe.
+pixelforge = { git = "https://github.com/KamilPostrozny/pixelforge", rev = "9d0729a8d44529c6748602651d971f6c3657e387", features = ["dmabuf"] }
 pulseaudio = "0.3.1"
 rcgen = "0.14.8"
 rsa = "0.9.10"
@@ -116,3 +122,8 @@ zvariant = "5.12.0"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+[patch.crates-io]
+# KamilPostrozny fork of tokio-enet 0.1.1: a lost reliable control message is resent after about one
+# round trip (C ENet's timeout), not after the 5 s floor.
+tokio-enet = { git = "https://github.com/KamilPostrozny/tokio-enet", rev = "9c0107ebe5a4c76292e97c2d85ada0c814e70e87" }

@@ -301,8 +301,9 @@ fn make_envs(context: &ApplicationContext, config_env: &BTreeMap<String, String>
 	// application's variables, so the application's own values (and Steam launch options, which
 	// Steam applies later) win. The opt-out is ferriscope-wsi's `FERRISCOPE_WSI_HOLD` (`fifo`,
 	// `off`, `0` or `false`, parsed by `ferriscope::WsiHold` as the layer parses it) in the
-	// application's `env`: one switch keeps every Game's own VSync choice, Vulkan and GL alike.
-	if forces_sync(config_env) {
+	// application's `env`: `off` is the one switch that turns off both the layer's hold and forced
+	// sync. Any other value is rejected and the application isn't launched.
+	if forces_sync(config_env)? {
 		envs.push("vblank_mode=3".to_string());
 		envs.push("__GL_SYNC_TO_VBLANK=1".to_string());
 	}
@@ -327,10 +328,12 @@ fn make_envs(context: &ApplicationContext, config_env: &BTreeMap<String, String>
 }
 
 /// Whether a Game gets forced sync: not when its environment opts out of ferriscope-wsi's hold,
-/// read with the layer's own parser.
-fn forces_sync(config_env: &BTreeMap<String, String>) -> bool {
+/// read with the layer's own parser. An unrecognised value is an error, never "hold everything".
+fn forces_sync(config_env: &BTreeMap<String, String>) -> Result<bool, ()> {
 	let hold = config_env.get(ferriscope::WsiHold::VARIABLE).map(String::as_str);
-	ferriscope::WsiHold::from_value(hold) == ferriscope::WsiHold::Every
+	let hold = ferriscope::WsiHold::parse(hold)
+		.map_err(|rejected| tracing::error!("Application env {rejected}; not launching the application."))?;
+	Ok(hold == ferriscope::WsiHold::Every)
 }
 
 /// Wait for a `JobRemoved` signal matching the given job path, accepting only `"done"` as success.
@@ -1202,6 +1205,32 @@ mod tests {
 				effective(&envs, "__GL_SYNC_TO_VBLANK"),
 				None,
 				"FERRISCOPE_WSI_HOLD={value}"
+			);
+		}
+	}
+
+	#[test]
+	fn the_off_switch_turns_off_both_the_hold_and_forced_sync() {
+		let env = BTreeMap::from([("FERRISCOPE_WSI_HOLD".to_string(), "off".to_string())]);
+
+		let envs = make_envs(&test_context(), &env).unwrap();
+
+		// The Game's environment tells ferriscope-wsi to hold nothing...
+		let hold = effective(&envs, ferriscope::WsiHold::VARIABLE);
+		assert_eq!(ferriscope::WsiHold::parse(hold), Ok(ferriscope::WsiHold::Off));
+		// ...and carries no forced GL sync.
+		assert_eq!(effective(&envs, "vblank_mode"), None);
+		assert_eq!(effective(&envs, "__GL_SYNC_TO_VBLANK"), None);
+	}
+
+	#[test]
+	fn an_unrecognised_hold_value_is_rejected() {
+		for value in ["FIFO", "Off", "no", "all"] {
+			let env = BTreeMap::from([("FERRISCOPE_WSI_HOLD".to_string(), value.to_string())]);
+
+			assert!(
+				make_envs(&test_context(), &env).is_err(),
+				"FERRISCOPE_WSI_HOLD={value} was accepted"
 			);
 		}
 	}

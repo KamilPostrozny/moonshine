@@ -5,6 +5,7 @@
 
 mod dmabuf;
 mod fence;
+mod filler;
 mod hdr_sei;
 
 use std::os::fd::AsRawFd;
@@ -114,6 +115,12 @@ fn is_device_lost(e: &PixelForgeError) -> bool {
 		// lost. See <...>".
 		_ => e.to_string().contains("device has been lost"),
 	}
+}
+
+/// The encoder's VBV: one frame interval, in the whole milliseconds pixelforge
+/// takes, rounded up so it never holds less than a frame.
+fn virtual_buffer_size_ms(fps: u32) -> u32 {
+	1000_u32.div_ceil(fps.max(1))
 }
 
 pub(crate) struct VideoPipeline {}
@@ -400,6 +407,10 @@ async fn run_packet_consumer(
 		};
 		let t_packet_ready = std::time::Instant::now();
 		let encode_wait_dur = t_packet_ready.saturating_duration_since(frame_context.submitted_at);
+
+		// CBR pads each frame to the bitrate budget; the padding would only cost
+		// airtime, so a light frame goes out at its real size.
+		filler::strip_filler(&mut packet.data, ctx.video_format);
 
 		// Inject HDR metadata into the bitstream on key frames, but only when
 		// encoding as BT.2020+PQ. SDR frames encoded as BT.709 carry no HDR SEI.
@@ -709,13 +720,16 @@ impl VideoPipelineInner {
 		.with_pixel_format(pixel_format)
 		.with_bit_depth(bit_depth)
 		.with_color_description(color_description)
+		// CBR, not VBR capped at the same rate: on RADV a VBR frame of new content
+		// ran to many times the budget (1.8 MB against 62.5 KB at 60 Mbps, 120 fps).
+		// CBR's padding is stripped after encode instead (`filler`).
 		.with_rate_control(RateControlMode::Cbr)
 		.with_target_bitrate(ctx.bitrate as u32)
 		.with_frame_rate(ctx.fps, 1)
 		.with_gop_size(0) // Infinite GOP, we'll request IDR frames manually
 		.with_b_frames(0) // No B-frames for low latency
 		.with_max_reference_frames(ctx.max_reference_frames)
-		.with_virtual_buffer_size_ms(1000 / ctx.fps)
+		.with_virtual_buffer_size_ms(virtual_buffer_size_ms(ctx.fps))
 		.with_initial_virtual_buffer_size_ms(0);
 
 		// The healthcheck doesn't advertise formats the GPU can't encode, so only a client
@@ -1279,7 +1293,7 @@ impl VideoPipelineInner {
 
 #[cfg(test)]
 mod tests {
-	use super::{drm_fourcc_to_input, is_device_lost};
+	use super::{drm_fourcc_to_input, is_device_lost, virtual_buffer_size_ms};
 	use ash::vk;
 	use pixelforge::{InputFormat, PixelForgeError};
 
@@ -1353,5 +1367,14 @@ mod tests {
 		assert!(!is_device_lost(&PixelForgeError::CommandBuffer(
 			"submit failed".to_string()
 		)));
+	}
+
+	#[test]
+	fn virtual_buffer_holds_at_least_one_frame_interval() {
+		// 1000/120 = 8.33 ms, 1000/60 = 16.67, 1000/144 = 6.94, 1000/50 = 20.
+		assert_eq!(virtual_buffer_size_ms(120), 9);
+		assert_eq!(virtual_buffer_size_ms(60), 17);
+		assert_eq!(virtual_buffer_size_ms(144), 7);
+		assert_eq!(virtual_buffer_size_ms(50), 20);
 	}
 }

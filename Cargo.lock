@@ -2340,6 +2340,7 @@ dependencies = [
  "inputtino",
  "libc",
  "mdns-sd",
+ "memchr",
  "mio 1.2.2",
  "mio-timerfd",
  "network-interface",

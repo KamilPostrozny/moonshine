@@ -283,6 +283,20 @@ impl RtpClock {
 	}
 }
 
+/// The packet sender wrote a frame's shards to the client's socket: from the start of the first
+/// write to the end of the last. The latency protocol reports it to the client (type 6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FrameSent {
+	/// The frame index its packets carry.
+	pub frame_number: u32,
+	pub started: Instant,
+	pub ended: Instant,
+}
+
+/// Frame-sent reports a subscriber can fall behind by before it loses the oldest; the control
+/// loop drains them every iteration.
+const FRAME_SENT_CAPACITY: usize = 64;
+
 /// Handle returned by `VideoStream::start` that gates the pipeline and packet handler.
 ///
 /// The pipeline and packet handler are spawned immediately but wait for the start flag
@@ -298,6 +312,8 @@ pub(crate) struct VideoStreamHandle {
 	resume_pending: Arc<AtomicBool>,
 	/// The clock stamping the video RTP timestamps.
 	rtp_clock: RtpClock,
+	/// Every frame the packet sender wrote to the client.
+	frame_sent_tx: broadcast::Sender<FrameSent>,
 }
 
 impl VideoStreamHandle {
@@ -324,6 +340,11 @@ impl VideoStreamHandle {
 	/// The capture time of video RTP timestamp 0; `None` until the first frame went out.
 	pub fn rtp_epoch(&self) -> Option<Instant> {
 		self.rtp_clock.epoch()
+	}
+
+	/// Reports of the frames written to the client from now on.
+	pub fn frame_sent(&self) -> broadcast::Receiver<FrameSent> {
+		self.frame_sent_tx.subscribe()
 	}
 
 	/// Reset the stream's frame/sequence counters for a resuming client.
@@ -426,6 +447,8 @@ impl VideoStream {
 		// Packet channel. Each queued batch holds its frame's in-flight slot, so the
 		// channel never holds more than the in-flight limit.
 		let (packet_tx, packet_rx) = mpsc::channel::<PacketBatch>(MAX_FRAMES_IN_FLIGHT);
+		// Reports of the frames the packet handler writes to the client.
+		let (frame_sent_tx, _) = broadcast::channel(FRAME_SENT_CAPACITY);
 
 		// Spawn packet handler — gated behind start.
 		spawn_handle_video_packets(
@@ -433,6 +456,7 @@ impl VideoStream {
 			socket,
 			start.waiter(),
 			reset_tx.clone(),
+			frame_sent_tx.clone(),
 			resume_pending.clone(),
 			stop.clone(),
 		);
@@ -463,6 +487,7 @@ impl VideoStream {
 			invalidate_tx,
 			resume_pending,
 			rtp_clock,
+			frame_sent_tx,
 		})
 	}
 }
@@ -472,6 +497,7 @@ fn spawn_handle_video_packets(
 	socket: UdpGsoSocket,
 	mut start: StartWaiter,
 	reset_tx: broadcast::Sender<u32>,
+	frame_sent_tx: broadcast::Sender<FrameSent>,
 	resume_pending: Arc<AtomicBool>,
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
 ) {
@@ -499,7 +525,7 @@ fn spawn_handle_video_packets(
 							// Taking the batch frees its frame's in-flight slot, so a slow
 							// send doesn't hold back encoding; a stall still fills the
 							// slots with the batches queued behind it.
-							let (epoch, shards) = batch.into_parts();
+							let (epoch, frame_number, shards) = batch.into_parts();
 							if let Some(addr) = client_address {
 								// Frames from before a resume's reset would reach the new client
 								// with old frame numbers, making it drop the reset frames as stale.
@@ -509,11 +535,19 @@ fn spawn_handle_video_packets(
 
 								// Sends are wrapped in wrap_cancel so a socket that
 								// stops draining cannot block session shutdown.
+								let started = std::time::Instant::now();
 								match stop_session_manager
 									.wrap_cancel(socket.send_batch(&shards, addr))
 									.await
 								{
 									Ok(failed_chunks) => {
+										let ended = std::time::Instant::now();
+										// No subscriber (no latency protocol client) is not an error.
+										let _ = frame_sent_tx.send(FrameSent {
+											frame_number,
+											started,
+											ended,
+										});
 										if failed_chunks > 0
 											&& last_send_warn
 												.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1))
@@ -583,6 +617,7 @@ mod tests {
 			socket,
 			start.waiter(),
 			reset_tx,
+			broadcast::channel(1).0,
 			Arc::new(AtomicBool::new(false)),
 			stop.clone(),
 		);
@@ -608,6 +643,7 @@ mod tests {
 			socket,
 			start.waiter(),
 			reset_tx,
+			broadcast::channel(1).0,
 			Arc::new(AtomicBool::new(false)),
 			stop.clone(),
 		);
@@ -630,6 +666,60 @@ mod tests {
 		})
 		.await
 		.expect("sender kept in-flight slots after taking their batches");
+	}
+
+	#[tokio::test]
+	async fn a_frame_written_to_the_client_is_reported_with_its_send_times() {
+		use std::sync::atomic::AtomicUsize;
+
+		let socket = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
+		let host = socket.local_addr().unwrap();
+		let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		let (packet_tx, packet_rx) = mpsc::channel(MAX_FRAMES_IN_FLIGHT);
+		let (reset_tx, _) = broadcast::channel(1);
+		let (frame_sent_tx, mut frame_sent) = broadcast::channel(FRAME_SENT_CAPACITY);
+		let start = StartSignal::new();
+		let stop = ShutdownManager::new();
+		spawn_handle_video_packets(
+			packet_rx,
+			socket,
+			start.waiter(),
+			reset_tx,
+			frame_sent_tx,
+			Arc::new(AtomicBool::new(false)),
+			stop.clone(),
+		);
+		start.trigger();
+		let in_flight = Arc::new(AtomicUsize::new(0));
+		let shards = || shard_batch::ShardBuf::new(2, 64, 0).into_batch();
+
+		// Before the client's PING there is nowhere to send a frame: it isn't reported.
+		packet_tx.try_send(PacketBatch::frame(1, shards(), &in_flight)).unwrap();
+		while in_flight.load(Ordering::Relaxed) > 0 {
+			tokio::task::yield_now().await;
+		}
+		assert!(frame_sent.try_recv().is_err());
+
+		client.send_to(b"PING", host).await.unwrap();
+		tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+		let before = Instant::now();
+		packet_tx.try_send(PacketBatch::frame(2, shards(), &in_flight)).unwrap();
+		let sent = tokio::time::timeout(std::time::Duration::from_secs(1), frame_sent.recv())
+			.await
+			.expect("the sent frame was never reported")
+			.unwrap();
+
+		assert_eq!(sent.frame_number, 2);
+		assert!(before <= sent.started && sent.started <= sent.ended && sent.ended <= Instant::now());
+		let mut buf = [0u8; 128];
+		for _ in 0..2 {
+			let len = tokio::time::timeout(std::time::Duration::from_secs(1), client.recv(&mut buf))
+				.await
+				.expect("the frame's shards never reached the client")
+				.unwrap();
+			assert_eq!(len, 64);
+		}
+		stop.trigger_shutdown(SessionShutdownReason::ManagerShutdown).unwrap();
 	}
 
 	#[test]

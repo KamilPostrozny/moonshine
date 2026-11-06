@@ -256,7 +256,8 @@ fn make_envs(context: &ApplicationContext, config_env: &BTreeMap<String, String>
 	// NVIDIA's proprietary GL reads `__GL_SYNC_TO_VBLANK`. Pushed before the compositor's and the
 	// application's variables, so the application's own values (and Steam launch options, which
 	// Steam applies later) win. The opt-out is ferriscope-wsi's `FERRISCOPE_WSI_HOLD` (`fifo`,
-	// `off`): one switch keeps every Game's own VSync choice, Vulkan and GL alike.
+	// `off`, `0` or `false`, parsed by `ferriscope::WsiHold` as the layer parses it) in the
+	// application's `env`: one switch keeps every Game's own VSync choice, Vulkan and GL alike.
 	if forces_sync(config_env) {
 		envs.push("vblank_mode=3".to_string());
 		envs.push("__GL_SYNC_TO_VBLANK=1".to_string());
@@ -281,13 +282,11 @@ fn make_envs(context: &ApplicationContext, config_env: &BTreeMap<String, String>
 	Ok(envs)
 }
 
-/// Whether a Game gets forced sync: not when its environment opts out of ferriscope-wsi's hold
-/// (`FERRISCOPE_WSI_HOLD` is `fifo`, `off`, `0` or `false`, as the layer parses it).
+/// Whether a Game gets forced sync: not when its environment opts out of ferriscope-wsi's hold,
+/// read with the layer's own parser.
 fn forces_sync(config_env: &BTreeMap<String, String>) -> bool {
-	!matches!(
-		config_env.get("FERRISCOPE_WSI_HOLD").map(String::as_str),
-		Some("fifo" | "off" | "0" | "false")
-	)
+	let hold = config_env.get(ferriscope::WsiHold::VARIABLE).map(String::as_str);
+	ferriscope::WsiHold::from_value(hold) == ferriscope::WsiHold::Every
 }
 
 /// Wait for a `JobRemoved` signal matching the given job path, accepting only `"done"` as success.

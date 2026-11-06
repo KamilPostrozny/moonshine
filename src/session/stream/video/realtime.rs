@@ -3,9 +3,9 @@
 //! A Game that saturates the CPU otherwise delays the compositor, the video pipeline and the
 //! encoder's readback, which all run at the default policy: `SCHED_RR` puts them ahead of every
 //! normal thread whatever its nice. Each of them runs for well under a frame per frame, and the
-//! kernel's real-time throttling (`sched_rt_runtime_us`) still bounds them. In moonlight-ios'
-//! ticket 38 these three cut the Host's p95 under a CPU and GPU load; promoting every thread of the
-//! process (the tokio workers too) didn't, and nice -11 alone didn't either.
+//! kernel's real-time throttling (`sched_rt_runtime_us`) still bounds them. Measured on a Host
+//! under a CPU and GPU load, promoting these three cut the frame latency's p95; promoting every
+//! thread of the process (the tokio workers too) didn't, and nice -11 alone didn't either.
 //!
 //! Needs `RLIMIT_RTPRIO` of at least the priority (systemd's user manager passes on the limit of
 //! the user's login, 99 for the `audio` group on Arch and CachyOS); without it the threads keep
@@ -29,7 +29,16 @@ pub fn promote_stream_threads() {
 		.filter(|(_, result)| result.is_ok())
 		.map(|(name, _)| name.as_str())
 		.collect();
-	tracing::info!(priority = STREAM_PRIORITY, ?promoted, "Stream threads on SCHED_RR.");
+	if promoted.is_empty() {
+		tracing::warn!(priority = STREAM_PRIORITY, "No Stream thread on SCHED_RR.");
+	} else {
+		tracing::info!(
+			priority = STREAM_PRIORITY,
+			?promoted,
+			"{} Stream threads on SCHED_RR.",
+			promoted.len()
+		);
+	}
 	for (name, result) in &outcome {
 		if let Err(e) = result {
 			tracing::warn!("Failed to put thread {name} on SCHED_RR {STREAM_PRIORITY}: {e}");
@@ -101,16 +110,16 @@ mod tests {
 	#[test]
 	fn promotes_only_threads_with_a_matching_name() {
 		// Linux keeps 15 bytes of a thread's name: match by prefix.
-		let (matched, stop_matched, matched_handle) = named_thread("t38-promote-me-please");
-		let (other, stop_other, other_handle) = named_thread("t38-leave-me");
+		let (matched, stop_matched, matched_handle) = named_thread("rt-promote-me-please");
+		let (other, stop_other, other_handle) = named_thread("rt-leave-me");
 		// What the test runner gave them (SCHED_IDLE under some shells).
 		let before = policy(other);
 		assert_eq!(policy(matched), before);
 
-		let outcome = promote_threads(&["t38-promote-me"], 10);
+		let outcome = promote_threads(&["rt-promote-me"], 10);
 
 		assert_eq!(outcome.len(), 1, "{outcome:?}");
-		assert_eq!(outcome[0].0, "t38-promote-me-");
+		assert_eq!(outcome[0].0, "rt-promote-me-p");
 		match &outcome[0].1 {
 			Ok(()) => assert_eq!(policy(matched), libc::SCHED_RR),
 			// No RLIMIT_RTPRIO here: the thread keeps its policy.

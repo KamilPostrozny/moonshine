@@ -363,9 +363,9 @@ impl Drop for InFlightGuard {
 	}
 }
 
-/// Packet consumer thread: for each submitted frame, awaits its
+/// Packet consumer, a task on the Stream's send thread: for each submitted frame, awaits its
 /// [`EncodeFuture`] to get the encoded packet, injects HDR SEI if needed,
-/// packetizes and sends it over the network channel, and emits latency stats.
+/// packetizes (FEC included) and hands it to the network sender, and emits latency stats.
 ///
 /// Running this off the encoding thread is what realizes the latency win of the
 /// asynchronous encoder: a packet is resolved by pixelforge's readback thread at
@@ -601,6 +601,7 @@ impl VideoPipeline {
 		config: VideoStreamConfig,
 		context: VideoStreamContext,
 		keys_rx: SessionKeysReceiver,
+		send_runtime: tokio::runtime::Handle,
 		packet_tx: mpsc::Sender<PacketBatch>,
 		idr_tx: broadcast::Sender<()>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
@@ -621,16 +622,12 @@ impl VideoPipeline {
 			rtp_clock,
 		};
 
-		// Capture the main (multi-threaded) runtime handle so the OS-threaded
-		// encoding loop can spawn the async packet consumer as a task on it. `new`
-		// is called from within the session runtime, so `current()` is valid here.
-		let runtime = tokio::runtime::Handle::current();
-
 		std::thread::Builder::new()
 			.name("video-pipeline".to_string())
 			.spawn(move || {
+				let _ = crate::session::realtime::register_current("video-pipeline");
 				inner.run(
-					runtime,
+					send_runtime,
 					frames,
 					packet_tx,
 					idr_tx,
@@ -660,7 +657,7 @@ impl VideoPipelineInner {
 	#[allow(clippy::too_many_arguments)]
 	fn run(
 		self,
-		runtime: tokio::runtime::Handle,
+		send_runtime: tokio::runtime::Handle,
 		frames: CompositorFrames,
 		packet_tx: mpsc::Sender<PacketBatch>,
 		idr_tx: broadcast::Sender<()>,
@@ -697,12 +694,12 @@ impl VideoPipelineInner {
 				return;
 			},
 		};
-		// Every per-frame thread exists now, the encoder's readback included.
-		super::realtime::promote_stream_threads();
+		// The readback thread exists now; it started at the default policy (reset-on-fork).
+		let _ = crate::session::realtime::register_reported("pixelforge-encode-readback", encoder.readback_thread_id());
 
 		// Start the capture and encoding loop.
 		if let Err(e) = self.run_encoding_loop(
-			runtime,
+			send_runtime,
 			frames,
 			context,
 			encoder,
@@ -800,7 +797,7 @@ impl VideoPipelineInner {
 	#[allow(clippy::too_many_arguments)]
 	fn run_encoding_loop(
 		&self,
-		runtime: tokio::runtime::Handle,
+		send_runtime: tokio::runtime::Handle,
 		frames: CompositorFrames,
 		context: VideoContext,
 		mut encoder: Encoder,
@@ -825,8 +822,8 @@ impl VideoPipelineInner {
 
 		// The encoder is asynchronous: each `encode()` returns a future that
 		// resolves with that frame's packet once the GPU finishes. We hand each
-		// future, together with its per-frame context, to a dedicated consumer
-		// thread (in submission order via `frame_ctx_tx`) which awaits it and
+		// future, together with its per-frame context, to the packet consumer
+		// (in submission order via `frame_ctx_tx`) which awaits it and
 		// packetizes/sends — so packets go out as soon as the GPU finishes,
 		// independent of this loop's cadence.
 		//
@@ -846,12 +843,12 @@ impl VideoPipelineInner {
 			let config = self.config.clone();
 			let in_flight = in_flight.clone();
 			// The packetize/send half is pure async work (await the encode future,
-			// packetize, send) with no blocking GPU calls, so it runs as a task on
-			// moonshine's main runtime — a green thread multiplexed with the rest of
-			// the session — rather than its own OS thread. Only this capture/encode
-			// loop needs a real thread, as it blocks on the frame channel and the
-			// Vulkan submit path.
-			runtime.spawn(run_packet_consumer(
+			// packetize, send) with no blocking GPU calls. It runs as a task on the
+			// Stream's send thread, beside the network sender, at real-time
+			// priority: on moonshine's main runtime a loaded Host delayed it. Only
+			// this capture/encode loop needs a thread of its own, as it blocks on
+			// the frame channel and the Vulkan submit path.
+			send_runtime.spawn(run_packet_consumer(
 				frame_ctx_rx,
 				packet_tx,
 				stats_tx,
@@ -1347,8 +1344,12 @@ impl VideoPipelineInner {
 		}
 		drop(frame_ctx_tx);
 		// Wait for the consumer task to drain and send the remaining packets. This
-		// runs on a plain OS thread outside the runtime, so block on the task handle.
-		if let Err(e) = runtime.block_on(consumer) {
+		// runs on a plain OS thread outside the runtime, so block on the task handle;
+		// the send thread drives the task. A send thread that already ended at the
+		// session's shutdown cancelled it.
+		if let Err(e) = send_runtime.block_on(consumer)
+			&& e.is_panic()
+		{
 			tracing::warn!("Packet consumer task panicked: {e:?}");
 		}
 

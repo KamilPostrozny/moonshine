@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use async_shutdown::ShutdownManager;
 use serde::{Deserialize, Serialize};
+use tokio::sync::broadcast::error::TryRecvError;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio_enet::{Event, Host, HostConfig, Packet, PacketMode, PeerState};
@@ -19,7 +20,7 @@ use crate::session::compositor::{
 };
 use crate::session::manager::SessionShutdownReason;
 use crate::session::stream::StartSignal;
-use crate::session::stream::video::{RTP_CLOCK_RATE, VideoStreamHandle};
+use crate::session::stream::video::{FrameSent, RTP_CLOCK_RATE, VideoStreamHandle};
 
 mod feedback;
 pub(crate) mod input;
@@ -489,6 +490,15 @@ fn send_latency_message(
 	*sequence_number += 1;
 }
 
+/// The latency protocol's report of a frame the video sender wrote to the client.
+fn frame_sent_message(sent: &FrameSent) -> latency_protocol::Message {
+	latency_protocol::Message::FrameSent {
+		frame_number: sent.frame_number,
+		send_started_ns: latency_protocol::monotonic_ns(sent.started),
+		send_ended_ns: latency_protocol::monotonic_ns(sent.ended),
+	}
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_control_loop(
 	stream_timeout: u64,
@@ -520,6 +530,7 @@ async fn run_control_loop(
 	let mut capture_epoch_sent = false;
 	let mut latency_client_ready = false;
 	let mut last_clock_report = None;
+	let mut frame_sent = video_handle.frame_sent();
 
 	while !stop_session_manager.is_shutdown_triggered() {
 		// A clock-sync request this iteration received, with its host receive time, answered
@@ -696,6 +707,29 @@ async fn run_control_loop(
 			send_latency_message(&mut host, peer_id, &key, &mut sequence_number, &report);
 			tracing::info!("Latency protocol: frame clock {report:?}");
 			last_clock_report = Some(report);
+		}
+
+		// Report every frame written to the client once it listens, so it can split each frame's
+		// arrival between the host's send and the network. Drained every iteration either way.
+		loop {
+			let sent = match frame_sent.try_recv() {
+				Ok(sent) => sent,
+				Err(TryRecvError::Lagged(skipped)) => {
+					tracing::debug!("Latency protocol: {skipped} frame-sent reports skipped.");
+					continue;
+				},
+				Err(TryRecvError::Empty | TryRecvError::Closed) => break,
+			};
+			if latency_client_ready && let Some(peer_id) = connected_peer {
+				let key = context.keys_rx.borrow().remote_input_key.clone();
+				send_latency_message(
+					&mut host,
+					peer_id,
+					&key,
+					&mut sequence_number,
+					&frame_sent_message(&sent),
+				);
+			}
 		}
 
 		// Send HDR mode notification after the host.service() match to avoid double mutable borrow.

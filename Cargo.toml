@@ -66,8 +66,9 @@ pkcs8 = "0.11.0"
 # v0.10.0 plus upstream's reference-window fix (`f046afe`, only on upstream main, which
 # changes the encode API): RADV predicts HEVC/AV1 frames from one reference, and v0.10.0
 # sized the whole window by that, so every reference frame invalidation became an IDR.
-# Also the fork's global queue priority (`VideoContextBuilder::highest_queue_priority`).
-pixelforge = { git = "https://github.com/KamilPostrozny/pixelforge", rev = "d011835c968c86b15c133b919f3bce11b9631641", features = ["dmabuf"] }
+# Also the fork's global queue priority (`VideoContextBuilder::highest_queue_priority`) and its
+# bitstream readback from cached host memory.
+pixelforge = { git = "https://github.com/KamilPostrozny/pixelforge", rev = "9edfeea749368fa607d679e44d007999bf99e1a5", features = ["dmabuf"] }
 pulseaudio = "0.3.1"
 rcgen = "0.14.8"
 rsa = "0.9.10"

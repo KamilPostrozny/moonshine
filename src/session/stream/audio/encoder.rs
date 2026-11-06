@@ -77,6 +77,7 @@ impl AudioEncoder {
 		std::thread::Builder::new()
 			.name("audio-encode".to_string())
 			.spawn(move || {
+				let _ = crate::session::realtime::register_current("audio-encode");
 				inner.run(
 					frame_rx,
 					frame_recycle_tx,

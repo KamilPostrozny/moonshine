@@ -53,6 +53,16 @@ impl UdpGsoSocket {
 		Ok(Self { socket, udp_state })
 	}
 
+	/// The same socket, registered with the I/O driver of the runtime it is called on, so its
+	/// readiness wakes that runtime's thread (the send thread) rather than the runtime that bound it.
+	pub fn reregister(self) -> std::io::Result<Self> {
+		let socket = UdpSocket::from_std(self.socket.into_std()?)?;
+		Ok(Self {
+			socket,
+			udp_state: self.udp_state,
+		})
+	}
+
 	/// Local address the socket is bound to.
 	pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
 		self.socket.local_addr()

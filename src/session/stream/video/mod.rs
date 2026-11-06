@@ -15,7 +15,6 @@ use crate::session::stream::{StartSignal, StartWaiter};
 mod gso_socket;
 mod packetizer;
 mod pipeline;
-mod realtime;
 mod shard_batch;
 use gso_socket::UdpGsoSocket;
 pub(crate) use pipeline::KcmpProbe;
@@ -460,8 +459,9 @@ impl VideoStream {
 		// Reports of the frames the packet handler writes to the client.
 		let (frame_sent_tx, _) = broadcast::channel(FRAME_SENT_CAPACITY);
 
-		// Spawn packet handler — gated behind start.
-		spawn_handle_video_packets(
+		// Spawn the send thread, whose sender is gated behind start; the pipeline spawns the
+		// packet consumer on it.
+		let send_runtime = spawn_send_thread(
 			packet_rx,
 			socket,
 			start.waiter(),
@@ -469,7 +469,7 @@ impl VideoStream {
 			frame_sent_tx.clone(),
 			resume_pending.clone(),
 			stop.clone(),
-		);
+		)?;
 
 		// Spawn pipeline thread — gated behind start.
 		let rtp_clock = RtpClock::default();
@@ -478,6 +478,7 @@ impl VideoStream {
 			config,
 			context,
 			keys_rx,
+			send_runtime,
 			packet_tx,
 			idr_tx.clone(),
 			idr_tx.subscribe(),
@@ -502,7 +503,47 @@ impl VideoStream {
 	}
 }
 
-fn spawn_handle_video_packets(
+/// The name of the Stream's send thread, also its real-time registration.
+const SEND_THREAD: &str = "video-send";
+
+/// Starts the Stream's send thread: one thread, registered at real-time priority (see
+/// `session::realtime`), whose own runtime runs the network sender and the packet consumer the
+/// pipeline spawns on the returned handle (await each encode, strip the filler, FEC, packetize).
+/// The thread ends with the sender, at the session's shutdown, and drops the consumer then.
+#[allow(clippy::too_many_arguments)]
+fn spawn_send_thread(
+	packet_rx: mpsc::Receiver<PacketBatch>,
+	socket: UdpGsoSocket,
+	start: StartWaiter,
+	reset_tx: broadcast::Sender<u32>,
+	frame_sent_tx: broadcast::Sender<FrameSent>,
+	resume_pending: Arc<AtomicBool>,
+	stop_session_manager: ShutdownManager<SessionShutdownReason>,
+) -> Result<tokio::runtime::Handle, ()> {
+	let runtime = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()
+		.map_err(|e| tracing::error!("Failed to build the video send runtime: {e}"))?;
+	let handle = runtime.handle().clone();
+	std::thread::Builder::new()
+		.name(SEND_THREAD.to_string())
+		.spawn(move || {
+			let _ = crate::session::realtime::register_current(SEND_THREAD);
+			runtime.block_on(handle_video_packets(
+				packet_rx,
+				socket,
+				start,
+				reset_tx,
+				frame_sent_tx,
+				resume_pending,
+				stop_session_manager,
+			));
+		})
+		.map_err(|e| tracing::error!("Failed to start the video send thread: {e}"))?;
+	Ok(handle)
+}
+
+async fn handle_video_packets(
 	mut packet_rx: mpsc::Receiver<PacketBatch>,
 	socket: UdpGsoSocket,
 	mut start: StartWaiter,
@@ -511,104 +552,111 @@ fn spawn_handle_video_packets(
 	resume_pending: Arc<AtomicBool>,
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
 ) {
-	tokio::spawn(async move {
-		if !start.wait(&stop_session_manager).await {
+	// Wakes on this runtime's own I/O driver, not on the main runtime's workers.
+	let socket = match socket.reregister() {
+		Ok(socket) => socket,
+		Err(e) => {
+			tracing::error!("Failed to move the video socket to the send thread: {e}");
+			let _ = stop_session_manager.trigger_shutdown(SessionShutdownReason::VideoPacketHandlerStopped);
 			return;
-		}
+		},
+	};
+	if !start.wait(&stop_session_manager).await {
+		return;
+	}
 
-		let mut buf = [0; 1024];
-		let mut client_address = None;
-		// Epoch of the last reset fired; batches packetized before it carry old counters.
-		let mut reset_epoch = 0u32;
-		// Rate-limits the GSO-fallback warning.
-		let mut last_send_warn: Option<std::time::Instant> = None;
+	let mut buf = [0; 1024];
+	let mut client_address = None;
+	// Epoch of the last reset fired; batches packetized before it carry old counters.
+	let mut reset_epoch = 0u32;
+	// Rate-limits the GSO-fallback warning.
+	let mut last_send_warn: Option<std::time::Instant> = None;
 
-		// Trigger session shutdown if we exit unexpectedly.
-		let _stop_token = stop_session_manager.trigger_shutdown_token(SessionShutdownReason::VideoPacketHandlerStopped);
-		let _delay_stop = stop_session_manager.delay_shutdown_token();
+	// Trigger session shutdown if we exit unexpectedly.
+	let _stop_token = stop_session_manager.trigger_shutdown_token(SessionShutdownReason::VideoPacketHandlerStopped);
+	let _delay_stop = stop_session_manager.delay_shutdown_token();
 
-		while !stop_session_manager.is_shutdown_triggered() {
-			tokio::select! {
-				batch = stop_session_manager.wrap_cancel(packet_rx.recv()) => {
-					match batch {
-						Ok(Some(batch)) => {
-							// Taking the batch frees its frame's in-flight slot, so a slow
-							// send doesn't hold back encoding; a stall still fills the
-							// slots with the batches queued behind it.
-							let (epoch, frame_number, shards) = batch.into_parts();
-							if let Some(addr) = client_address {
-								// Frames from before a resume's reset would reach the new client
-								// with old frame numbers, making it drop the reset frames as stale.
-								if epoch < reset_epoch || shards.shard_count() == 0 {
-									continue;
-								}
-
-								// Sends are wrapped in wrap_cancel so a socket that
-								// stops draining cannot block session shutdown.
-								let started = std::time::Instant::now();
-								match stop_session_manager
-									.wrap_cancel(socket.send_batch(&shards, addr))
-									.await
-								{
-									Ok(failed_chunks) => {
-										let ended = std::time::Instant::now();
-										// No subscriber (no latency protocol client) is not an error.
-										let _ = frame_sent_tx.send(FrameSent {
-											frame_number,
-											started,
-											ended,
-										});
-										if failed_chunks > 0
-											&& last_send_warn
-												.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1))
-										{
-											tracing::warn!(
-												"GSO send failed for {failed_chunks} chunk(s), sent per-shard instead"
-											);
-											last_send_warn = Some(std::time::Instant::now());
-										}
-									},
-									Err(_) => break,
-								}
+	while !stop_session_manager.is_shutdown_triggered() {
+		tokio::select! {
+			batch = stop_session_manager.wrap_cancel(packet_rx.recv()) => {
+				match batch {
+					Ok(Some(batch)) => {
+						// Taking the batch frees its frame's in-flight slot, so a slow
+						// send doesn't hold back encoding; a stall still fills the
+						// slots with the batches queued behind it.
+						let (epoch, frame_number, shards) = batch.into_parts();
+						if let Some(addr) = client_address {
+							// Frames from before a resume's reset would reach the new client
+							// with old frame numbers, making it drop the reset frames as stale.
+							if epoch < reset_epoch || shards.shard_count() == 0 {
+								continue;
 							}
-						},
-						Ok(None) => {
-							tracing::debug!("Video packet channel closed.");
-							break;
-						},
-						Err(_) => break,
-					}
-				},
 
-				message = stop_session_manager.wrap_cancel(socket.recv_from(&mut buf)) => {
-					let (len, address) = match message {
-						Ok(Ok((len, address))) => (len, address),
-						Ok(Err(e)) => {
-							tracing::warn!("Failed to receive message: {e}");
-							break;
-						},
-						Err(_) => break,
-					};
-
-					if &buf[..len] == b"PING" {
-						tracing::trace!("Received video stream PING message from {address}.");
-						client_address = Some(address);
-
-						// Fire a resume's reset now that frames reach the client's current address.
-						if resume_pending.swap(false, Ordering::Relaxed) {
-							tracing::info!("Resumed client address is {address}, resetting video stream.");
-							reset_epoch += 1;
-							let _ = reset_tx.send(reset_epoch);
+							// Sends are wrapped in wrap_cancel so a socket that
+							// stops draining cannot block session shutdown.
+							let started = std::time::Instant::now();
+							match stop_session_manager
+								.wrap_cancel(socket.send_batch(&shards, addr))
+								.await
+							{
+								Ok(failed_chunks) => {
+									let ended = std::time::Instant::now();
+									// No subscriber (no latency protocol client) is not an error.
+									let _ = frame_sent_tx.send(FrameSent {
+										frame_number,
+										started,
+										ended,
+									});
+									if failed_chunks > 0
+										&& last_send_warn
+											.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1))
+									{
+										tracing::warn!(
+											"GSO send failed for {failed_chunks} chunk(s), sent per-shard instead"
+										);
+										last_send_warn = Some(std::time::Instant::now());
+									}
+								},
+								Err(_) => break,
+							}
 						}
-					} else {
-						tracing::warn!("Received unknown message on video stream of length {len}.");
-					}
-				},
-			}
-		}
+					},
+					Ok(None) => {
+						tracing::debug!("Video packet channel closed.");
+						break;
+					},
+					Err(_) => break,
+				}
+			},
 
-		tracing::debug!("Video packet stream stopped.");
-	});
+			message = stop_session_manager.wrap_cancel(socket.recv_from(&mut buf)) => {
+				let (len, address) = match message {
+					Ok(Ok((len, address))) => (len, address),
+					Ok(Err(e)) => {
+						tracing::warn!("Failed to receive message: {e}");
+						break;
+					},
+					Err(_) => break,
+				};
+
+				if &buf[..len] == b"PING" {
+					tracing::trace!("Received video stream PING message from {address}.");
+					client_address = Some(address);
+
+					// Fire a resume's reset now that frames reach the client's current address.
+					if resume_pending.swap(false, Ordering::Relaxed) {
+						tracing::info!("Resumed client address is {address}, resetting video stream.");
+						reset_epoch += 1;
+						let _ = reset_tx.send(reset_epoch);
+					}
+				} else {
+					tracing::warn!("Received unknown message on video stream of length {len}.");
+				}
+			},
+		}
+	}
+
+	tracing::debug!("Video packet stream stopped.");
 }
 
 #[cfg(test)]
@@ -622,7 +670,7 @@ mod tests {
 		let (reset_tx, _) = broadcast::channel(1);
 		let start = StartSignal::new();
 		let stop = ShutdownManager::new();
-		spawn_handle_video_packets(
+		spawn_send_thread(
 			packet_rx,
 			socket,
 			start.waiter(),
@@ -630,12 +678,46 @@ mod tests {
 			broadcast::channel(1).0,
 			Arc::new(AtomicBool::new(false)),
 			stop.clone(),
-		);
+		)
+		.unwrap();
 
 		stop.trigger_shutdown(SessionShutdownReason::ManagerShutdown).unwrap();
 		tokio::time::timeout(std::time::Duration::from_secs(1), packet_tx.closed())
 			.await
 			.expect("packet handler kept its socket after shutdown");
+	}
+
+	#[tokio::test]
+	async fn the_packet_consumer_runs_on_the_send_thread() {
+		let socket = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
+		let (packet_tx, packet_rx) = mpsc::channel(1);
+		let (reset_tx, _) = broadcast::channel(1);
+		let start = StartSignal::new();
+		let stop = ShutdownManager::new();
+		let send_runtime = spawn_send_thread(
+			packet_rx,
+			socket,
+			start.waiter(),
+			reset_tx,
+			broadcast::channel(1).0,
+			Arc::new(AtomicBool::new(false)),
+			stop.clone(),
+		)
+		.unwrap();
+		start.trigger();
+
+		// Where the pipeline spawns its packet consumer: beside the sender, on the one
+		// real-time send thread.
+		let consumer_thread = send_runtime
+			.spawn(async { std::thread::current().name().map(str::to_owned) })
+			.await
+			.unwrap();
+		assert_eq!(consumer_thread.as_deref(), Some(SEND_THREAD));
+
+		stop.trigger_shutdown(SessionShutdownReason::ManagerShutdown).unwrap();
+		tokio::time::timeout(std::time::Duration::from_secs(1), packet_tx.closed())
+			.await
+			.expect("the send thread kept running after shutdown");
 	}
 
 	#[tokio::test]
@@ -648,7 +730,7 @@ mod tests {
 		let start = StartSignal::new();
 		let stop = ShutdownManager::new();
 		// Until started, the sender doesn't drain the channel, like a stalled socket.
-		spawn_handle_video_packets(
+		spawn_send_thread(
 			packet_rx,
 			socket,
 			start.waiter(),
@@ -656,7 +738,8 @@ mod tests {
 			broadcast::channel(1).0,
 			Arc::new(AtomicBool::new(false)),
 			stop.clone(),
-		);
+		)
+		.unwrap();
 
 		let in_flight = Arc::new(AtomicUsize::new(0));
 		for _ in 0..MAX_FRAMES_IN_FLIGHT {
@@ -691,7 +774,7 @@ mod tests {
 		let start = StartSignal::new();
 		let stop = ShutdownManager::new();
 		let resume_pending = Arc::new(AtomicBool::new(false));
-		spawn_handle_video_packets(
+		spawn_send_thread(
 			packet_rx,
 			socket,
 			start.waiter(),
@@ -699,7 +782,8 @@ mod tests {
 			frame_sent_tx,
 			resume_pending.clone(),
 			stop.clone(),
-		);
+		)
+		.unwrap();
 		start.trigger();
 		let in_flight = Arc::new(AtomicUsize::new(0));
 		let shards = || shard_batch::ShardBuf::new(2, 64, 0).into_batch();

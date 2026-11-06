@@ -32,6 +32,7 @@ pub mod compositor;
 pub mod inhibit;
 pub mod instance;
 pub mod manager;
+pub(crate) mod realtime;
 pub mod stream;
 
 /// Timeout in seconds for the HTTP launch endpoint to wait for the session to launch.

@@ -46,7 +46,7 @@ fec-rs = "0.1.0"
 # for x86_64 and i686, a session teardown that leaves no Xwayland, socket or lock behind, and a
 # frame clock that a new consumer sends back to nominal with no shift pending. Reports the
 # compositor thread's ID (`Compositor::thread_id`) for real-time registration.
-ferriscope = { git = "https://github.com/KamilPostrozny/ferriscope", rev = "d0181554cc7bc0ba250845047934b46c61288483", default-features = false }
+ferriscope = { git = "https://github.com/KamilPostrozny/ferriscope", rev = "df8e2daeec317b1b0b623e15adc08769af5e8402", default-features = false }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 gethostname = "1.1.0"
 hex = "0.4.3"

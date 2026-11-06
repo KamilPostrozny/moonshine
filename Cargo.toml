@@ -37,13 +37,16 @@ clap = { version = "4.6.1", features = ["derive"], optional = true }
 crossbeam-channel = "0.5.15"
 dasp_sample = "0.11.0"
 dirs = "6.0.0"
-fec-rs = { version = "0.1.0", features = ["parallel"] }
+# Without `parallel`: FEC runs on the real-time send thread, not on rayon's pool of
+# normal-priority threads. A frame's ~60 shards take microseconds sequentially.
+fec-rs = "0.1.0"
 # The KamilPostrozny fork's `latency` branch: upstream plus the embedder-steered frame clock
 # (`CompositorHandles::frame_clock`) the latency protocol's corrections drive, and ferriscope's
 # WSI layer holding Games in every present mode (ferriscope_swapchain_v1 version 2), installed
 # for x86_64 and i686, a session teardown that leaves no Xwayland, socket or lock behind, and a
-# frame clock that a new consumer sends back to nominal with no shift pending.
-ferriscope = { git = "https://github.com/KamilPostrozny/ferriscope", rev = "b3d8b95b82ee716de29f6b3f28c8ed5d94cb3719", default-features = false }
+# frame clock that a new consumer sends back to nominal with no shift pending. Reports the
+# compositor thread's ID (`Compositor::thread_id`) for real-time registration.
+ferriscope = { git = "https://github.com/KamilPostrozny/ferriscope", rev = "d0181554cc7bc0ba250845047934b46c61288483", default-features = false }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 gethostname = "1.1.0"
 hex = "0.4.3"
@@ -66,9 +69,10 @@ pkcs8 = "0.11.0"
 # v0.10.0 plus upstream's reference-window fix (`f046afe`, only on upstream main, which
 # changes the encode API): RADV predicts HEVC/AV1 frames from one reference, and v0.10.0
 # sized the whole window by that, so every reference frame invalidation became an IDR.
-# Also the fork's global queue priority (`VideoContextBuilder::highest_queue_priority`) and its
-# bitstream readback from cached host memory.
-pixelforge = { git = "https://github.com/KamilPostrozny/pixelforge", rev = "9edfeea749368fa607d679e44d007999bf99e1a5", features = ["dmabuf"] }
+# Also the fork's global queue priority (`VideoContextBuilder::highest_queue_priority`), its
+# bitstream readback from cached host memory, and its readback thread's ID
+# (`Encoder::readback_thread_id`) for real-time registration.
+pixelforge = { git = "https://github.com/KamilPostrozny/pixelforge", rev = "c7e6d109b6073a8bbe7c06b1ade417689a2f2bff", features = ["dmabuf"] }
 pulseaudio = "0.3.1"
 rcgen = "0.14.8"
 rsa = "0.9.10"

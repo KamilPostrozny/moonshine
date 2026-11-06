@@ -69,6 +69,13 @@ pub struct VideoStreamConfig {
 	/// `net.core.wmem_max`.
 	#[serde(default)]
 	pub send_buffer_size: usize,
+
+	/// Vulkan video encode quality level. `0` is the driver's fastest preset
+	/// (RADV: Speed); higher levels trade encode time for picture quality
+	/// (RADV `1`: Balance). Must be below the GPU's `maxQualityLevels`, or the
+	/// encoder fails to start.
+	#[serde(default)]
+	pub encode_quality_level: u32,
 }
 
 /// Smallest accepted packet size cap. Lower values would leave almost no room
@@ -105,6 +112,7 @@ impl Default for VideoStreamConfig {
 			log_frame_spikes: false,
 			max_packet_size: 0,
 			send_buffer_size: 0,
+			encode_quality_level: 0,
 		}
 	}
 }
@@ -746,6 +754,15 @@ mod tests {
 		assert_eq!(keyframe_burst_bytes(80_000_000, 120), 83_333 * KEYFRAME_BURST_FRAMES);
 		// A zero frame rate doesn't divide by zero.
 		assert_eq!(keyframe_burst_bytes(8_000, 0), 1_000 * KEYFRAME_BURST_FRAMES);
+	}
+
+	#[test]
+	fn encode_quality_level_defaults_to_fastest() {
+		let unset: VideoStreamConfig = toml::from_str("port = 1\nfec_percentage = 20").unwrap();
+		assert_eq!(unset.encode_quality_level, 0);
+		assert_eq!(VideoStreamConfig::default().encode_quality_level, 0);
+		let set: VideoStreamConfig = toml::from_str("port = 1\nfec_percentage = 20\nencode_quality_level = 1").unwrap();
+		assert_eq!(set.encode_quality_level, 1);
 	}
 
 	fn config(max_packet_size: usize) -> VideoStreamConfig {

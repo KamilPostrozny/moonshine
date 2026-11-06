@@ -65,7 +65,7 @@ pkcs8 = "0.11.0"
 # v0.10.0 plus upstream's reference-window fix (`f046afe`, only on upstream main, which
 # changes the encode API): RADV predicts HEVC/AV1 frames from one reference, and v0.10.0
 # sized the whole window by that, so every reference frame invalidation became an IDR.
-pixelforge = { git = "https://github.com/KamilPostrozny/pixelforge", rev = "4262658941fb988ab0f6b03cd550b8803be8cc8c", features = ["dmabuf"] }
+pixelforge = { git = "https://github.com/KamilPostrozny/pixelforge", rev = "e577eb187e9ce6f28b9e8709447a5aa0f1c7ab6b", features = ["dmabuf"] }
 pulseaudio = "0.3.1"
 rcgen = "0.14.8"
 rsa = "0.9.10"

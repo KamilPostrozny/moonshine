@@ -756,7 +756,8 @@ impl VideoPipelineInner {
 		.with_b_frames(0) // No B-frames for low latency
 		.with_max_reference_frames(ctx.max_reference_frames)
 		.with_virtual_buffer_size_ms(virtual_buffer_size_ms(ctx.fps))
-		.with_initial_virtual_buffer_size_ms(0);
+		.with_initial_virtual_buffer_size_ms(0)
+		.with_encode_quality_level(self.config.encode_quality_level);
 
 		// The healthcheck doesn't advertise formats the GPU can't encode, so only a client
 		// that requested one anyway should get the "unsupported" hint.

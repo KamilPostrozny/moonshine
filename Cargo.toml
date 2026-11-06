@@ -42,7 +42,7 @@ fec-rs = { version = "0.1.0", features = ["parallel"] }
 # (`CompositorHandles::frame_clock`) the latency protocol's corrections drive, and ferriscope's
 # WSI layer holding Games in every present mode (ferriscope_swapchain_v1 version 2), installed
 # for x86_64 and i686, and a session teardown that leaves no Xwayland, socket or lock behind.
-ferriscope = { git = "https://github.com/KamilPostrozny/ferriscope", rev = "a3e118ee69d584fe90ba35c92de6badea33eadd6", default-features = false }
+ferriscope = { git = "https://github.com/KamilPostrozny/ferriscope", rev = "c8e994a732a48740944bafd2ef81e52e2262a2ba", default-features = false }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 gethostname = "1.1.0"
 hex = "0.4.3"

@@ -33,6 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A Steam application (`steam_integration`) stops with Steam's own shutdown: its unit's `ExecStop` runs `steam -shutdown` and waits for the unit's main process to exit, with a 30 s stop timeout (other Games keep 5 s), so Steam writes cloud saves and its config instead of being sent `SIGTERM` at once. The compositor stays up until the Game's unit has stopped, and Moonshine waits up to 35 s for the stop job (was 2 s, after which it dropped the compositor under a Steam still shutting down).
 - The Game's transient unit unsets the desktop's compositor and IPC variables that the user manager would pass it (`NIRI_SOCKET`, `SWAYSOCK`, `I3SOCK`, `HYPRLAND_INSTANCE_SIGNATURE`, `XAUTHORITY`, `XDG_CURRENT_DESKTOP`, `XDG_SESSION_DESKTOP`, `DESKTOP_STARTUP_ID`, `XDG_ACTIVATION_TOKEN`), except those Moonshine sets itself. Unsetting them in Moonshine's own environment didn't reach the unit.
 - Exit 0 on SIGTERM or SIGINT (was 1), so a service manager records a stop as a success.
+- Only a peer's first control message that decrypts under the Stream's key makes it the client, resets the per-client latency state and starts a new frame-clock consumer. A bare ENet connection, an unencrypted message or one under another key from any other peer is ignored, so a stray LAN peer can no longer reset or take over a live Stream's control session, keep it alive with pings, or end it with a malformed message (a 4-byte input message no longer panics the control loop).
+- Pin ferriscope at `c8e994a` (`latency` with ticket 05): a new frame-clock consumer (a reconnecting client) starts at the nominal period with no phase shift pending, instead of measuring for up to a second on the previous client's steering.
+- Log the steerable report at debug, not info: it is sent after every installed correction (about 4 lines a second per Stream).
 
 ## [v0.16.1] - 13-09-2026
 

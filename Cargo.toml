@@ -66,7 +66,7 @@ pkcs8 = "0.11.0"
 # changes the encode API): RADV predicts HEVC/AV1 frames from one reference, and v0.10.0
 # sized the whole window by that, so every reference frame invalidation became an IDR.
 # Also the fork's global queue priority (`VideoContextBuilder::highest_queue_priority`).
-pixelforge = { git = "https://github.com/KamilPostrozny/pixelforge", rev = "0bbadc8d90451c6ead4aae4510ef4824ffd6690f", features = ["dmabuf"] }
+pixelforge = { git = "https://github.com/KamilPostrozny/pixelforge", rev = "d011835c968c86b15c133b919f3bce11b9631641", features = ["dmabuf"] }
 pulseaudio = "0.3.1"
 rcgen = "0.14.8"
 rsa = "0.9.10"

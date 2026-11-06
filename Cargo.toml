@@ -43,9 +43,9 @@ fec-rs = "0.1.0"
 # The KamilPostrozny fork's `latency` branch: upstream plus the embedder-steered frame clock
 # (`CompositorHandles::frame_clock`) the latency protocol's corrections drive, and ferriscope's
 # WSI layer holding Games in every present mode (ferriscope_swapchain_v1 version 2), installed
-# for x86_64 and i686. Reports the compositor thread's ID (`Compositor::thread_id`) for real-time
-# registration.
-ferriscope = { git = "https://github.com/KamilPostrozny/ferriscope", rev = "b90beccdcaa79e0e14e6b6e1428a6967a2b81a57", default-features = false }
+# for x86_64 and i686, and a session teardown that leaves no Xwayland, socket or lock behind.
+# Reports the compositor thread's ID (`Compositor::thread_id`) for real-time registration.
+ferriscope = { git = "https://github.com/KamilPostrozny/ferriscope", rev = "59a4453ca0bc50590082da92753717f7db5f908e", default-features = false }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 gethostname = "1.1.0"
 hex = "0.4.3"

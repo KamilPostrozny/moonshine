@@ -894,6 +894,19 @@ mod tests {
 			self.server.recv(self.token).unwrap();
 		}
 
+		/// Corks or uncorks the stream on `channel`.
+		fn cork(&mut self, channel: u32, cork: bool) {
+			self.seq += 1;
+			pulse::write_command_message(
+				&mut self.peer,
+				self.seq,
+				&pulse::Command::CorkPlaybackStream(pulse::CorkStreamParams { channel, cork }),
+				pulse::MAX_VERSION,
+			)
+			.unwrap();
+			self.server.recv(self.token).unwrap();
+		}
+
 		fn frames(&self) -> Vec<AudioFrame> {
 			self.frames.try_iter().collect()
 		}
@@ -968,6 +981,44 @@ mod tests {
 		// One period re-primes it.
 		pulse.write_audio(channel, 5, 0.5);
 		assert_eq!(pulse.events(), vec![pulse::Command::Started(channel)]);
+	}
+
+	#[test]
+	fn an_uncorked_stream_starts_after_one_minimum_request() {
+		let mut pulse = Harness::new(20);
+		let channel = pulse.create_stream(attr(Some(20), None)).channel;
+		pulse.cork(channel, true);
+		pulse.cork(channel, false);
+		assert!(
+			pulse.events().contains(&pulse::Command::Request(pulse::Request {
+				channel,
+				length: 20 * MS
+			})),
+			"uncorking asks for the whole target"
+		);
+
+		// One period of audio starts playback, as when the stream was created.
+		pulse.write_audio(channel, 5, 0.5);
+		assert_eq!(pulse.events(), vec![pulse::Command::Started(channel)]);
+	}
+
+	#[test]
+	fn a_stream_uncorked_with_a_period_queued_plays_at_once() {
+		let mut pulse = Harness::new(20);
+		let channel = pulse.create_stream(attr(Some(20), None)).channel;
+		pulse.write_audio(channel, 10, 0.5);
+		pulse.cork(channel, true);
+		pulse.cork(channel, false);
+		pulse.events();
+
+		pulse.server.clock_expired(1).unwrap();
+		let frames = pulse.frames();
+		assert_eq!(frames.len(), 1);
+		assert!(
+			frames[0].buf.iter().all(|&s| s == 0.5),
+			"the queued audio plays on the next tick"
+		);
+		assert!(!pulse.events().iter().any(|e| matches!(e, pulse::Command::Underflow(_))));
 	}
 
 	#[test]

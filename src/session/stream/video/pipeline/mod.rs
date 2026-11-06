@@ -33,6 +33,7 @@ use crate::session::stream::video::{
 pub(crate) use dmabuf::KcmpProbe;
 use dmabuf::{CachedImport, DmaBufImporter, DmaBufPlane};
 
+use pixelforge::vulkan::QueueGlobalPriority;
 use pixelforge::{
 	Codec, ColorConverter, ColorConverterConfig, ColorDescription, ColorRange, ColorSpec, EncodeConfig, EncodeFuture,
 	Encoder, EncoderTuningMode, InputFormat, OutputFormat, PixelForgeError, PixelFormat, RateControlMode, VideoContext,
@@ -121,6 +122,23 @@ fn is_device_lost(e: &PixelForgeError) -> bool {
 /// takes, rounded up so it never holds less than a frame.
 fn virtual_buffer_size_ms(fps: u32) -> u32 {
 	1000_u32.div_ceil(fps.max(1))
+}
+
+/// Logs the global priority the video context's queues got (moonlight-ios fork). Anything
+/// below realtime is a fallback: on amdgpu, priorities above medium need `CAP_SYS_NICE`,
+/// which only root can give the binary (`setcap cap_sys_nice+ep`). ferriscope's compositor
+/// queue is created by smithay and keeps the default priority either way.
+fn log_queue_priority(priority: Option<QueueGlobalPriority>) {
+	match priority {
+		Some(QueueGlobalPriority::Realtime) => {
+			tracing::info!("Video GPU queues at global priority realtime.");
+		},
+		Some(priority) => tracing::warn!(
+			"Video GPU queues at global priority {priority}: the driver grants nothing higher to this \
+			 process (on amdgpu that needs CAP_SYS_NICE)."
+		),
+		None => tracing::warn!("Video GPU queues at the default priority: no VK_KHR_global_priority."),
+	}
 }
 
 pub(crate) struct VideoPipeline {}
@@ -706,10 +724,13 @@ impl VideoPipelineInner {
 	fn create_encoder(&self) -> Result<(VideoContext, Encoder), String> {
 		let ctx = &self.context;
 
-		// Create Vulkan video context.
+		// Create Vulkan video context, its queues at the highest global priority the driver
+		// grants, so a GPU-bound Game doesn't hold up the conversion and the encode.
 		let context = VideoContextBuilder::new()
+			.highest_queue_priority()
 			.build()
 			.map_err(|e| format!("Failed to create video context: {e}"))?;
+		log_queue_priority(context.queue_priority());
 
 		// Convert our video format to pixelforge's codec.
 		let codec = match ctx.video_format {

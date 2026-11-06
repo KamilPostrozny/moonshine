@@ -7,6 +7,7 @@ use std::time::Duration;
 use async_shutdown::ShutdownManager;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use zbus::proxy::SignalStream;
 use zbus::{Connection, MatchRule, MessageStream, Proxy};
@@ -99,8 +100,40 @@ const PROPERTIES_CHANGED: &str = "PropertiesChanged";
 const UNIT_INTERFACE: &str = "org.freedesktop.systemd1.Unit";
 const ACTIVE_STATE_PROPERTY: &str = "ActiveState";
 
-const STOP_JOB_TIMEOUT: Duration = Duration::from_secs(2);
+/// The Game unit's stop timeout (`TimeoutStopUSec`), which systemd gives each stop step
+/// (`ExecStop`, then `SIGTERM` to what is left) before the next.
+const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A Steam application's stop timeout: Steam's own shutdown writes cloud saves and its config
+/// before it exits, which takes longer than a Game's exit.
+const STEAM_STOP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long Moonshine waits for a stop job: longer than any Game unit's stop timeout, so the
+/// compositor, which stays until the Game's unit has stopped, outlives a Steam still shutting down.
+const STOP_JOB_TIMEOUT: Duration = Duration::from_secs(STEAM_STOP_TIMEOUT.as_secs() + 5);
+const _: () = assert!(STOP_JOB_TIMEOUT.as_secs() > STEAM_STOP_TIMEOUT.as_secs());
+const _: () = assert!(STOP_JOB_TIMEOUT.as_secs() > STOP_TIMEOUT.as_secs());
+
 const UNIT_REMOVED_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Variables of the desktop session that the user manager passes to every unit it starts: the
+/// desktop compositor's displays and IPC sockets, and the desktop's identity. The Game's unit
+/// unsets the ones Moonshine doesn't set itself, so a Stream Game can't reach the desktop's
+/// compositor (unsetting them in Moonshine's own environment doesn't reach the unit). The session
+/// bus stays: the Stream shares the user's, and clients find it at `$XDG_RUNTIME_DIR/bus` anyway.
+const DESKTOP_ENVIRONMENT: &[&str] = &[
+	"WAYLAND_DISPLAY",
+	"DISPLAY",
+	"XAUTHORITY",
+	"NIRI_SOCKET",
+	"SWAYSOCK",
+	"I3SOCK",
+	"HYPRLAND_INSTANCE_SIGNATURE",
+	"XDG_CURRENT_DESKTOP",
+	"XDG_SESSION_DESKTOP",
+	"DESKTOP_STARTUP_ID",
+	"XDG_ACTIVATION_TOKEN",
+];
 
 /// Start-job wait (includes `ExecStartPre`), decoupled from `launch_timeout_secs` so a `pre_command` isn't cut off.
 const START_JOB_TIMEOUT: Duration = Duration::from_secs(90);
@@ -128,6 +161,9 @@ pub(crate) struct LaunchOptions<'a> {
 	pub post_commands: &'a Vec<Vec<String>>,
 	pub stdout_value: &'a Option<String>,
 	pub stderr_value: &'a Option<String>,
+	/// A Steam application (`steam_integration`): stopped with Steam's own shutdown and
+	/// `STEAM_STOP_TIMEOUT`.
+	pub steam: bool,
 }
 
 /// Runtime context required to launch an application.
@@ -151,13 +187,19 @@ pub(crate) struct Application {
 	unit_name: String,
 	config: ApplicationConfig,
 	exit_monitor: Option<JoinHandle<()>>,
+	/// Dropped only after `drop` has stopped the unit: its receiver (the compositor) then knows
+	/// the Game no longer needs its display.
+	_unit_stopped: oneshot::Sender<()>,
 }
 
 impl Application {
+	/// `unit_stopped` is dropped once the application's unit has stopped, or with the error if the
+	/// launch fails.
 	pub async fn spawn(
 		config: ApplicationConfig,
 		context: ApplicationContext,
 		stop: ShutdownManager<SessionShutdownReason>,
+		unit_stopped: oneshot::Sender<()>,
 	) -> Result<Self, ()> {
 		let Some(program) = config.command.first() else {
 			tracing::error!("Application command is empty.");
@@ -188,6 +230,7 @@ impl Application {
 			post_commands: &config.post_command,
 			stdout_value: &config.stdout,
 			stderr_value: &config.stderr,
+			steam: config.steam_integration,
 		};
 
 		let unit_path = match start_transient_service(&conn, &options).await {
@@ -204,6 +247,7 @@ impl Application {
 			unit_name: context.unit_name,
 			config,
 			exit_monitor: Some(exit_monitor),
+			_unit_stopped: unit_stopped,
 		})
 	}
 }
@@ -582,50 +626,112 @@ fn split_standard_io(value: &Option<String>) -> (String, Option<(&'static str, S
 	(v.to_string(), None)
 }
 
-/// Launch the application as a transient systemd service unit via D-Bus.
-async fn start_transient_service(conn: &Connection, options: &LaunchOptions<'_>) -> Result<OwnedObjectPath, ()> {
-	// Resolve exec entries in a blocking task — `which::which` does filesystem lookups.
-	let (pre_entries, main_entry, post_entries) = tokio::task::spawn_blocking({
-		let pre_commands = options.pre_commands.clone();
-		let post_commands = options.post_commands.clone();
-		let main_program = options.program.to_string();
-		let args = options.args.to_vec();
-		move || -> Result<_, ()> {
-			let program_for_error = main_program.clone();
-			Ok((
-				build_exec_entries(&pre_commands),
-				build_exec_entry(main_program, args.clone()).ok_or_else(move || {
-					tracing::error!("Main program '{}' not found in PATH.", program_for_error);
-				})?,
-				build_exec_entries(&post_commands),
-			))
-		}
-	})
-	.await
-	.map_err(|e| tracing::error!("spawn_blocking panicked: {e}"))??;
+/// One systemd exec command: (absolute path, argv, ignore failure).
+type ExecEntry = (String, Vec<String>, bool);
 
-	tracing::debug!(?pre_entries, ?main_entry, ?post_entries, "Building transient service");
+/// The Game unit's commands, resolved to absolute paths.
+struct UnitCommands {
+	pre: Vec<ExecEntry>,
+	main: ExecEntry,
+	/// `ExecStop`: Steam's own shutdown, for a Steam application.
+	stop: Option<ExecEntry>,
+	post: Vec<ExecEntry>,
+}
 
+/// A Steam application's `ExecStop`, run by `sh` with Steam as `$1`: Steam's own shutdown
+/// (`steam -shutdown`), so it writes cloud saves and its config, then a wait for the unit's main
+/// process (`$MAINPID`, the Steam the unit started), because systemd sends `SIGTERM` to whatever is
+/// left as soon as `ExecStop` returns. With the main process already gone it sends nothing:
+/// `steam -shutdown` with no Steam running starts one. systemd expands only `${NAME}` inside a
+/// word, so `$MAINPID` and `$1` reach `sh` as written.
+const STEAM_SHUTDOWN_SCRIPT: &str = r#"[ -n "$MAINPID" ] && kill -0 "$MAINPID" 2>/dev/null || exit 0
+"$1" -shutdown
+while kill -0 "$MAINPID" 2>/dev/null; do sleep 0.2 || exit 1; done"#;
+
+fn steam_shutdown_entry(shell: String, steam: String) -> ExecEntry {
+	let argv = vec![
+		shell.clone(),
+		"-c".to_string(),
+		STEAM_SHUTDOWN_SCRIPT.to_string(),
+		"steam-shutdown".to_string(),
+		steam,
+	];
+	(shell, argv, false)
+}
+
+/// Resolve `sh` and `steam` for a Steam application's `ExecStop`. Without them it stops with
+/// `SIGTERM` after the stop timeout, as any Game.
+fn resolve_steam_shutdown() -> Option<ExecEntry> {
+	let resolve = |program: &str| {
+		which::which(program)
+			.ok()
+			.and_then(|path| path.to_str().map(str::to_string))
+	};
+	match (resolve("sh"), resolve("steam")) {
+		(Some(shell), Some(steam)) => Some(steam_shutdown_entry(shell, steam)),
+		_ => {
+			tracing::warn!("No sh or steam in PATH: the Steam application will stop with SIGTERM.");
+			None
+		},
+	}
+}
+
+/// The desktop's variables (`DESKTOP_ENVIRONMENT`) that `envs` doesn't assign. Only those are
+/// unset: systemd applies `UnsetEnvironment=` after `Environment=`, so it would also remove the
+/// Stream's own `DISPLAY` and `WAYLAND_DISPLAY`.
+fn desktop_variables_to_unset(envs: &[String]) -> Vec<String> {
+	DESKTOP_ENVIRONMENT
+		.iter()
+		.filter(|name| {
+			!envs
+				.iter()
+				.any(|assignment| assignment.split_once('=').is_some_and(|(key, _)| key == **name))
+		})
+		.map(|name| name.to_string())
+		.collect()
+}
+
+/// The properties of the Game's transient unit.
+fn unit_properties<'a>(
+	options: &'a LaunchOptions<'a>,
+	commands: &UnitCommands,
+) -> Result<Vec<(String, zvariant::Value<'a>)>, ()> {
 	// Split StandardOutput/StandardError into the enum value plus an optional
 	// companion path property. Unit-file syntax (`StandardOutput=file:/path`) is
 	// not accepted over D-Bus; the path must be a separate property
 	// (`StandardOutput=file` + `StandardOutputFile=/path`).
 	let (stdout_setting, stdout_path) = split_standard_io(options.stdout_value);
 	let (stderr_setting, stderr_path) = split_standard_io(options.stderr_value);
+	let stop_timeout = if options.steam {
+		STEAM_STOP_TIMEOUT
+	} else {
+		STOP_TIMEOUT
+	};
 
 	// Properties: a(sv) — array of (property_name: s, value: v)
 	// zvariant::Value has D-Bus type 'v' (variant), so Vec<(String, Value)> serialises as a(sv).
 	//
 	// IMPORTANT: do NOT use zvariant::Array::from(Vec<Value>) — it always produces `av`
 	// (array of variant). Build typed arrays with Array::new(signature) + append() instead.
-	let mut properties: Vec<(String, zvariant::Value<'_>)> = vec![
+	let mut properties: Vec<(String, zvariant::Value<'a>)> = vec![
 		("Type".to_string(), zvariant::Value::Str("exec".into())),
 		("Slice".to_string(), zvariant::Value::Str("moonshine.slice".into())),
 		// Environment: as
 		("Environment".to_string(), zvariant::Value::from(options.envs.to_vec())),
+		// UnsetEnvironment: as
+		(
+			"UnsetEnvironment".to_string(),
+			zvariant::Value::from(desktop_variables_to_unset(options.envs)),
+		),
 		// ExecStart: a(sasb)
-		("ExecStart".to_string(), build_exec_array(&[main_entry])?),
-		("TimeoutStopUSec".to_string(), zvariant::Value::U64(5_000_000)),
+		(
+			"ExecStart".to_string(),
+			build_exec_array(std::slice::from_ref(&commands.main))?,
+		),
+		(
+			"TimeoutStopUSec".to_string(),
+			zvariant::Value::U64(stop_timeout.as_micros() as u64),
+		),
 		(
 			"CollectMode".to_string(),
 			zvariant::Value::Str("inactive-or-failed".into()),
@@ -646,14 +752,54 @@ async fn start_transient_service(conn: &Connection, options: &LaunchOptions<'_>)
 		properties.push((format!("StandardError{prop}"), zvariant::Value::Str(path.into())));
 	}
 
-	// Only include ExecStartPre/ExecStopPost when non-empty: an empty a(sasb) array still
+	// Only include ExecStartPre/ExecStop/ExecStopPost when non-empty: an empty a(sasb) array still
 	// needs a valid element signature, and omitting absent properties is cleaner.
-	if !pre_entries.is_empty() {
-		properties.push(("ExecStartPre".to_string(), build_exec_array(&pre_entries)?));
+	if !commands.pre.is_empty() {
+		properties.push(("ExecStartPre".to_string(), build_exec_array(&commands.pre)?));
 	}
-	if !post_entries.is_empty() {
-		properties.push(("ExecStopPost".to_string(), build_exec_array(&post_entries)?));
+	if let Some(stop) = &commands.stop {
+		properties.push(("ExecStop".to_string(), build_exec_array(std::slice::from_ref(stop))?));
 	}
+	if !commands.post.is_empty() {
+		properties.push(("ExecStopPost".to_string(), build_exec_array(&commands.post)?));
+	}
+
+	Ok(properties)
+}
+
+/// Launch the application as a transient systemd service unit via D-Bus.
+async fn start_transient_service(conn: &Connection, options: &LaunchOptions<'_>) -> Result<OwnedObjectPath, ()> {
+	// Resolve exec entries in a blocking task — `which::which` does filesystem lookups.
+	let commands = tokio::task::spawn_blocking({
+		let pre_commands = options.pre_commands.clone();
+		let post_commands = options.post_commands.clone();
+		let main_program = options.program.to_string();
+		let args = options.args.to_vec();
+		let steam = options.steam;
+		move || -> Result<_, ()> {
+			let program_for_error = main_program.clone();
+			Ok(UnitCommands {
+				pre: build_exec_entries(&pre_commands),
+				main: build_exec_entry(main_program, args).ok_or_else(move || {
+					tracing::error!("Main program '{}' not found in PATH.", program_for_error);
+				})?,
+				stop: if steam { resolve_steam_shutdown() } else { None },
+				post: build_exec_entries(&post_commands),
+			})
+		}
+	})
+	.await
+	.map_err(|e| tracing::error!("spawn_blocking panicked: {e}"))??;
+
+	tracing::debug!(
+		pre_entries = ?commands.pre,
+		main_entry = ?commands.main,
+		stop_entry = ?commands.stop,
+		post_entries = ?commands.post,
+		"Building transient service"
+	);
+
+	let properties = unit_properties(options, &commands)?;
 
 	// Aux units: empty a(sa(sv))
 	let aux: Vec<(&str, Vec<(&str, zvariant::Value)>)> = Vec::new();
@@ -811,9 +957,13 @@ fn build_exec_array(entries: &[(String, Vec<String>, bool)]) -> Result<zvariant:
 
 #[cfg(test)]
 mod tests {
-	use super::{ApplicationConfig, ApplicationContext, make_envs, split_standard_io};
+	use super::{
+		ApplicationConfig, ApplicationContext, LaunchOptions, UnitCommands, make_envs, split_standard_io,
+		steam_shutdown_entry, unit_properties,
+	};
 	use std::collections::{BTreeMap, HashMap};
 	use std::path::PathBuf;
+	use std::time::Duration;
 
 	#[test]
 	fn test_steam_integration_defaults_to_off() {
@@ -888,6 +1038,123 @@ mod tests {
 			compositor_env: Vec::new(),
 			extra_env: HashMap::new(),
 		}
+	}
+
+	fn property<'p>(properties: &'p [(String, zvariant::Value<'p>)], name: &str) -> Option<&'p zvariant::Value<'p>> {
+		properties.iter().find(|(key, _)| key == name).map(|(_, value)| value)
+	}
+
+	#[test]
+	fn a_steam_application_stops_with_steams_shutdown_and_the_longer_timeout() {
+		let envs = make_envs(&test_context(), &BTreeMap::new()).unwrap();
+		let shutdown = steam_shutdown_entry("/usr/bin/sh".to_string(), "/usr/bin/steam".to_string());
+		let steam = launch_options(&envs, true);
+		let game = launch_options(&envs, false);
+
+		let steam = unit_properties(&steam, &commands(Some(shutdown.clone()))).unwrap();
+		let game = unit_properties(&game, &commands(None)).unwrap();
+
+		assert_eq!(
+			property(&steam, "TimeoutStopUSec"),
+			Some(&zvariant::Value::U64(30_000_000))
+		);
+		assert_eq!(
+			property(&steam, "ExecStop"),
+			Some(&super::build_exec_array(&[shutdown]).unwrap())
+		);
+		assert_eq!(
+			property(&game, "TimeoutStopUSec"),
+			Some(&zvariant::Value::U64(5_000_000))
+		);
+		assert_eq!(property(&game, "ExecStop"), None);
+	}
+
+	/// A stand-in Steam in `dir`: `steam -shutdown` creates `dir/shutdown`.
+	fn stand_in_steam(dir: &std::path::Path) -> (String, PathBuf) {
+		use std::os::unix::fs::PermissionsExt;
+		let flag = dir.join("shutdown");
+		let steam = dir.join("steam");
+		std::fs::write(
+			&steam,
+			format!("#!/bin/sh\n[ \"$1\" = -shutdown ] && touch '{}'\n", flag.display()),
+		)
+		.unwrap();
+		std::fs::set_permissions(&steam, std::fs::Permissions::from_mode(0o755)).unwrap();
+		(steam.to_str().unwrap().to_string(), flag)
+	}
+
+	/// Other tests in this binary change `PATH`; the stand-ins get their own.
+	const STAND_IN_PATH: &str = "/usr/bin:/bin";
+
+	/// Run `entry` as systemd's `ExecStop` would, killing it after 10 s.
+	fn run_exec_stop(entry: &(String, Vec<String>, bool), main_pid: Option<u32>) -> std::process::ExitStatus {
+		let mut command = std::process::Command::new(&entry.0);
+		command
+			.args(&entry.1[1..])
+			.env("PATH", STAND_IN_PATH)
+			.env_remove("MAINPID");
+		if let Some(pid) = main_pid {
+			command.env("MAINPID", pid.to_string());
+		}
+		let mut child = command.spawn().unwrap();
+		let deadline = std::time::Instant::now() + Duration::from_secs(10);
+		loop {
+			if let Some(status) = child.try_wait().unwrap() {
+				return status;
+			}
+			if std::time::Instant::now() > deadline {
+				child.kill().ok();
+				child.wait().ok();
+				panic!("ExecStop still running after 10 s");
+			}
+			std::thread::sleep(Duration::from_millis(20));
+		}
+	}
+
+	#[test]
+	fn steams_shutdown_returns_only_after_steam_has_exited() {
+		let dir = tempfile::tempdir().unwrap();
+		let (steam, flag) = stand_in_steam(dir.path());
+		// The unit's main process: Steam, which exits 0.5 s after it is asked to shut down (or
+		// after 5 s without being asked).
+		let mut main = std::process::Command::new("/bin/sh")
+			.args([
+				"-c",
+				"i=0; while [ ! -e \"$0\" ] && [ $i -lt 100 ]; do sleep 0.05 || exit 1; i=$((i + 1)); done; sleep 0.5",
+			])
+			.arg(&flag)
+			.env("PATH", STAND_IN_PATH)
+			.spawn()
+			.unwrap();
+		let pid = main.id();
+		// systemd reaps the main process; here the test does.
+		let reaper = std::thread::spawn(move || {
+			main.wait().unwrap();
+			std::time::Instant::now()
+		});
+
+		let status = run_exec_stop(&steam_shutdown_entry("/bin/sh".to_string(), steam), Some(pid));
+		let returned = std::time::Instant::now();
+
+		assert!(status.success());
+		assert!(flag.exists(), "steam -shutdown was not run");
+		assert!(reaper.join().unwrap() <= returned, "returned before Steam exited");
+	}
+
+	#[test]
+	fn steams_shutdown_starts_no_steam_once_steam_has_exited() {
+		let dir = tempfile::tempdir().unwrap();
+		let (steam, flag) = stand_in_steam(dir.path());
+		let entry = steam_shutdown_entry("/bin/sh".to_string(), steam);
+		let mut exited = std::process::Command::new("/bin/true").spawn().unwrap();
+		let gone = exited.id();
+		exited.wait().unwrap();
+
+		// systemd leaves MAINPID unset once the main process has exited.
+		assert!(run_exec_stop(&entry, None).success());
+		assert!(run_exec_stop(&entry, Some(gone)).success());
+
+		assert!(!flag.exists(), "steam -shutdown ran with no Steam to shut down");
 	}
 
 	#[test]
@@ -993,5 +1260,126 @@ mod tests {
 		.unwrap();
 
 		assert_eq!(config.env.get("COSMIC_BACKEND").map(String::as_str), Some("winit"));
+	}
+
+	fn launch_options<'a>(envs: &'a [String], steam: bool) -> LaunchOptions<'a> {
+		static NO_COMMANDS: Vec<Vec<String>> = Vec::new();
+		static NO_OUTPUT: Option<String> = None;
+		LaunchOptions {
+			unit_name: "moonshine-session.service",
+			program: "game",
+			args: &[],
+			envs,
+			timeout: Duration::from_secs(2),
+			pre_commands: &NO_COMMANDS,
+			post_commands: &NO_COMMANDS,
+			stdout_value: &NO_OUTPUT,
+			stderr_value: &NO_OUTPUT,
+			steam,
+		}
+	}
+
+	fn commands(stop: Option<(String, Vec<String>, bool)>) -> UnitCommands {
+		UnitCommands {
+			pre: Vec::new(),
+			main: ("/usr/bin/game".to_string(), vec!["/usr/bin/game".to_string()], false),
+			stop,
+			post: Vec::new(),
+		}
+	}
+
+	/// The environment systemd gives the unit's processes (systemd.exec(5)): the user manager's,
+	/// then `Environment=` assignments in order, then `UnsetEnvironment=` removes names (and exact
+	/// assignments) last, whoever set them.
+	fn unit_environment(
+		manager: &[(&str, &str)],
+		properties: &[(String, zvariant::Value<'_>)],
+	) -> BTreeMap<String, String> {
+		let strings = |name: &str| -> Vec<String> {
+			properties
+				.iter()
+				.filter(|(key, _)| key == name)
+				.flat_map(|(_, value)| <Vec<String>>::try_from(value.try_clone().unwrap()).unwrap())
+				.collect()
+		};
+		let mut env: BTreeMap<String, String> = manager
+			.iter()
+			.map(|(key, value)| (key.to_string(), value.to_string()))
+			.collect();
+		for assignment in strings("Environment") {
+			let (key, value) = assignment.split_once('=').unwrap();
+			env.insert(key.to_string(), value.to_string());
+		}
+		for unset in strings("UnsetEnvironment") {
+			match unset.split_once('=') {
+				Some((key, value)) if env.get(key).map(String::as_str) == Some(value) => {
+					env.remove(key);
+				},
+				Some(_) => {},
+				None => {
+					env.remove(&unset);
+				},
+			}
+		}
+		env
+	}
+
+	#[test]
+	fn a_game_unit_has_no_desktop_compositor_or_ipc_variables() {
+		// The shared Host's user manager (`systemctl --user show-environment` under niri), plus the
+		// sockets of other desktops a user session may export.
+		let manager = [
+			("HOME", "/home/kamil"),
+			("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
+			("DISPLAY", ":13"),
+			("WAYLAND_DISPLAY", "wayland-9"),
+			("NIRI_SOCKET", "/run/user/1000/niri.wayland-9.462431.sock"),
+			("SWAYSOCK", "/run/user/1000/sway-ipc.1000.1234.sock"),
+			("I3SOCK", "/run/user/1000/i3/ipc-socket.1234"),
+			("HYPRLAND_INSTANCE_SIGNATURE", "abc_123"),
+			("XAUTHORITY", "/run/user/1000/xauth_abc"),
+			("XDG_CURRENT_DESKTOP", "niri"),
+			("XDG_SESSION_DESKTOP", "niri"),
+			("DESKTOP_STARTUP_ID", "niri-1"),
+			("XDG_ACTIVATION_TOKEN", "token"),
+		];
+		let envs = make_envs(&test_context(), &BTreeMap::new()).unwrap();
+		let options = launch_options(&envs, false);
+
+		let env = unit_environment(&manager, &unit_properties(&options, &commands(None)).unwrap());
+
+		for desktop in [
+			"NIRI_SOCKET",
+			"SWAYSOCK",
+			"I3SOCK",
+			"HYPRLAND_INSTANCE_SIGNATURE",
+			"XAUTHORITY",
+			"XDG_CURRENT_DESKTOP",
+			"XDG_SESSION_DESKTOP",
+			"DESKTOP_STARTUP_ID",
+			"XDG_ACTIVATION_TOKEN",
+		] {
+			assert_eq!(env.get(desktop), None, "{desktop}");
+		}
+		// The Stream's own displays replace the desktop's, and the rest of the session stays.
+		assert_eq!(env.get("DISPLAY").map(String::as_str), Some(":0"));
+		assert_eq!(env.get("WAYLAND_DISPLAY").map(String::as_str), Some("wayland-1"));
+		assert_eq!(env.get("HOME").map(String::as_str), Some("/home/kamil"));
+	}
+
+	#[test]
+	fn the_compositors_own_desktop_identity_reaches_the_game() {
+		// ferriscope gives Steam gamescope's identity; only the desktop's is removed.
+		let mut context = test_context();
+		context.compositor_env = vec![("XDG_CURRENT_DESKTOP".to_string(), "gamescope".to_string())];
+		let envs = make_envs(&context, &BTreeMap::new()).unwrap();
+		let options = launch_options(&envs, true);
+
+		let env = unit_environment(
+			&[("XDG_CURRENT_DESKTOP", "niri")],
+			&unit_properties(&options, &commands(None)).unwrap(),
+		);
+
+		assert_eq!(env.get("XDG_CURRENT_DESKTOP").map(String::as_str), Some("gamescope"));
 	}
 }

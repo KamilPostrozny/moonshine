@@ -136,6 +136,9 @@ impl Drop for SessionManagerInner {
 		}
 		if self.session.is_some() {
 			tracing::debug!("Stopping active session before shutdown.");
+			// Drop the session first, as `stop_session` does: that stops the Game's unit, which the
+			// compositor waits for before the session's shutdown can complete.
+			self.session = None;
 			let _ = self.stop.trigger_shutdown(SessionShutdownReason::ManagerShutdown);
 			// Wait until shutdown completed.
 			if let Ok(handle) = tokio::runtime::Handle::try_current() {

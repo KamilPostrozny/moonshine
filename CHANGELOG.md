@@ -11,7 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Apply negotiated type-3 relative frame-clock corrections to the session's ferriscope compositor. Pin ferriscope to `KamilPostrozny/ferriscope` at `c3e1c06`: period within 1% of nominal, phase shift at most half a period per message and pending in total, slewed at most 250 µs per frame. After one second without corrections, ferriscope returns to nominal.
 - Send the type-4 steerable report after the client's first clock-sync request, and again when the compositor installs a correction. The acknowledgement is the sequence installed by the compositor thread, not merely queued by the control stream. All Moonshine Streams capture ferriscope's session, whose tick paces native Wayland and Xwayland clients, including Steam.
-- Pin ferriscope at `f70857a`: its WSI layer holds a Game in every present mode until the session's next tick, so a Game with VSync off (MAILBOX, IMMEDIATE) renders one frame per tick on the steered frame clock instead of unbounded. A Game can set `FERRISCOPE_WSI_HOLD=fifo` to hold FIFO only (the old behaviour) or `off`.
+- Pin ferriscope at `10df9b5` (`latency` plus ticket 47): its WSI layer holds a Game in every present mode until the session's next tick, so a Game with VSync off (MAILBOX, IMMEDIATE) renders one frame per tick on the steered frame clock instead of unbounded. A Game can set `FERRISCOPE_WSI_HOLD=fifo` to hold FIFO only (the old behaviour) or `off`.
+
+### Fixed
+
+- A reconnecting client's first steerable report no longer acknowledges the previous client's last correction, and corrections the previous client left queued are dropped (ferriscope `FrameClockSender::new_consumer`).
+- Pin ferriscope at `4b52cc2`: a correction queued for one second or longer (a stalled compositor) is dropped instead of installed as fresh, and a Steam FPS cap at the session rate no longer skips a callback when the grid is steered earlier.
+- The colour conversion and the encode are chained on the GPU (`convert_async` + `encode_after`): the encode is submitted while the conversion runs instead of after the CPU saw it finish. The frame still goes back to the compositor only once the conversion has read it.
 
 ## [v0.16.1] - 13-09-2026
 

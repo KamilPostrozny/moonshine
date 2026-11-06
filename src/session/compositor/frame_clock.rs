@@ -20,8 +20,20 @@ impl CompositorFrameClock {
 	/// All Moonshine video is captured from the session's ferriscope compositor.
 	/// Its frame callbacks and FIFO releases pace both native and Xwayland clients,
 	/// including Steam. There is no desktop-capture path to advertise as steerable.
+	///
+	/// `steerable` means the compositor's frame clock is connected to this session,
+	/// not that its thread is alive: a stalled compositor still reports steerable,
+	/// and the client sees it as corrections that are never acknowledged.
 	pub(crate) fn report(&self) -> Message {
 		report(self.0.get().map(FrameClockSender::last_applied))
+	}
+
+	/// A new client connected: its correction sequences start over, so neither the
+	/// last client's acknowledgement nor its queued corrections may reach it.
+	pub(crate) fn new_client(&self) {
+		if let Some(sender) = self.0.get() {
+			sender.new_consumer();
+		}
 	}
 
 	pub(crate) fn apply(&self, message: Message) {

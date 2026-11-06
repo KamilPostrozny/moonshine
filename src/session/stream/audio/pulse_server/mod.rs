@@ -297,6 +297,7 @@ impl PulseServer {
 		std::thread::Builder::new()
 			.name("pulse-server".to_string())
 			.spawn(move || {
+				let _ = crate::session::realtime::register_current("pulse-server");
 				if let Err(e) = server.run(stop.clone()) {
 					tracing::error!("PulseServer error: {e}");
 					let _ = stop.trigger_shutdown(SessionShutdownReason::PulseServerStopped);

@@ -32,6 +32,7 @@ pub mod compositor;
 pub mod inhibit;
 pub mod instance;
 pub mod manager;
+pub(crate) mod realtime;
 pub mod stream;
 
 /// Timeout in seconds for the HTTP launch endpoint to wait for the session to launch.
@@ -203,7 +204,9 @@ impl InitializedSession {
 			stop,
 		} = self;
 
-		let launched_compositor = compositor.launch()?;
+		// The compositor outlives the session's stop until the Game's unit has stopped.
+		let (game_stopped_tx, game_stopped) = tokio::sync::oneshot::channel();
+		let launched_compositor = compositor.launch(game_stopped)?;
 		let ready = launched_compositor.ready();
 		let pulse_socket_path = audio.pulse_socket_path.clone();
 
@@ -226,6 +229,7 @@ impl InitializedSession {
 				]),
 			},
 			stop,
+			game_stopped_tx,
 		)
 		.await?;
 

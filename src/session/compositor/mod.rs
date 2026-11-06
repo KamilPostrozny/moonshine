@@ -230,7 +230,10 @@ impl Compositor {
 		)
 	}
 
-	pub fn launch(self) -> Result<LaunchedCompositor, ()> {
+	/// `game_stopped` resolves (its sender is dropped) once the Game's unit has stopped: after the
+	/// session stops, ferriscope keeps running until then, so a Game (Steam's own shutdown) keeps
+	/// its display while it exits.
+	pub fn launch(self, game_stopped: tokio::sync::oneshot::Receiver<()>) -> Result<LaunchedCompositor, ()> {
 		let Self {
 			config,
 			context,
@@ -255,6 +258,9 @@ impl Compositor {
 		let (compositor, ferriscope_handles) = FerriscopeCompositor::launch(ferriscope_config).map_err(|e| {
 			tracing::error!("Failed to launch ferriscope compositor: {e}");
 		})?;
+		// Only that thread: Xwayland and the threads the compositor starts keep the default policy,
+		// whether they start before this or after (reset-on-fork).
+		let _ = crate::session::realtime::register_reported("ferriscope-compositor", compositor.thread_id());
 
 		let ferriscope_ready = match ferriscope_handles.ready.recv_timeout(READY_TIMEOUT) {
 			Ok(ready) => ready,
@@ -310,6 +316,7 @@ impl Compositor {
 			})?;
 		tokio::spawn(async move {
 			session_stop.wait_shutdown_triggered().await;
+			let _ = game_stopped.await;
 			stop_handle.stop();
 		});
 

@@ -114,3 +114,8 @@ zvariant = "5.12.0"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+[patch.crates-io]
+# KamilPostrozny fork of tokio-enet 0.1.1: a lost reliable control message is resent after about one
+# round trip (C ENet's timeout), not after the 5 s floor.
+tokio-enet = { git = "https://github.com/KamilPostrozny/tokio-enet", rev = "952fbd00dceddf4c43aa035fd737161c0ee293bf" }

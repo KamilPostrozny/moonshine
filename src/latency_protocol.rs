@@ -10,8 +10,10 @@
 //! The wire values match the KamilPostrozny moonlight-common-c fork (`LI_FF_LATENCY_PROTOCOL`,
 //! `ML_FF_LATENCY_PROTOCOL`, message type `0x55f0`).
 //!
-//! The host answers clock-sync requests and announces the capture epoch of the video RTP
-//! timestamps, so the client can place every frame's capture on its own clock.
+//! The host answers clock-sync requests, announces the capture epoch of the video RTP
+//! timestamps, so the client can place every frame's capture on its own clock, and reports when
+//! it wrote each video frame to its socket, so the client can split a frame's arrival between the
+//! host's send and the network.
 
 use std::sync::LazyLock;
 use std::time::Instant;
@@ -83,6 +85,13 @@ pub enum Message {
 	SteerableReport { steerable: bool, last_correction: u32 },
 	/// Type 5, host → client: the host time of video RTP timestamp 0, and the RTP clock rate.
 	CaptureEpoch { epoch_ns: u64, rtp_clock_rate: u32 },
+	/// Type 6, host → client: the host wrote a video frame's packets to its socket, from the start
+	/// of the first write to the end of the last. `frame_number` is the frame index its packets carry.
+	FrameSent {
+		frame_number: u32,
+		send_started_ns: u64,
+		send_ended_ns: u64,
+	},
 }
 
 impl Message {
@@ -116,6 +125,11 @@ impl Message {
 			5 => Some(Self::CaptureEpoch {
 				epoch_ns: reader.u64()?,
 				rtp_clock_rate: reader.u32()?,
+			}),
+			6 => Some(Self::FrameSent {
+				frame_number: reader.u32()?,
+				send_started_ns: reader.u64()?,
+				send_ended_ns: reader.u64()?,
 			}),
 			_ => None,
 		}
@@ -167,6 +181,16 @@ impl Message {
 				buffer.push(5);
 				buffer.extend(epoch_ns.to_le_bytes());
 				buffer.extend(rtp_clock_rate.to_le_bytes());
+			},
+			Self::FrameSent {
+				frame_number,
+				send_started_ns,
+				send_ended_ns,
+			} => {
+				buffer.push(6);
+				buffer.extend(frame_number.to_le_bytes());
+				buffer.extend(send_started_ns.to_le_bytes());
+				buffer.extend(send_ended_ns.to_le_bytes());
 			},
 		}
 		buffer
@@ -334,12 +358,26 @@ mod tests {
 		0x90, 0x5F, 0x01, 0x00,
 	];
 
-	const FIXTURES: [(Message, &[u8]); 5] = [
+	// Frame 258 left the host from 86 400.004 s to 210 µs later.
+	const FRAME_SENT: Message = Message::FrameSent {
+		frame_number: 258,
+		send_started_ns: 86_400_004_000_000,
+		send_ended_ns: 86_400_004_210_000,
+	};
+	const FRAME_SENT_BYTES: &[u8] = &[
+		0x01, 0x06, //
+		0x02, 0x01, 0x00, 0x00, //
+		0x00, 0x09, 0x8C, 0x91, 0x94, 0x4E, 0x00, 0x00, //
+		0x50, 0x3D, 0x8F, 0x91, 0x94, 0x4E, 0x00, 0x00,
+	];
+
+	const FIXTURES: [(Message, &[u8]); 6] = [
 		(SYNC_REQUEST, SYNC_REQUEST_BYTES),
 		(SYNC_REPLY, SYNC_REPLY_BYTES),
 		(CORRECTION, CORRECTION_BYTES),
 		(STEERABLE_REPORT, STEERABLE_REPORT_BYTES),
 		(CAPTURE_EPOCH, CAPTURE_EPOCH_BYTES),
+		(FRAME_SENT, FRAME_SENT_BYTES),
 	];
 
 	#[test]
@@ -357,7 +395,7 @@ mod tests {
 		assert_eq!(Message::decode(&other_version), None);
 		other_version[0] = 0x00;
 		assert_eq!(Message::decode(&other_version), None);
-		for unknown in [0x00, 0x06, 0xFF] {
+		for unknown in [0x00, 0x07, 0xFF] {
 			let mut bytes = SYNC_REQUEST_BYTES.to_vec();
 			bytes[1] = unknown;
 			assert_eq!(Message::decode(&bytes), None);
@@ -405,7 +443,7 @@ mod tests {
 				host_sent: 0x0000_0012_3456_ABCD,
 			})
 		);
-		for other in [SYNC_REPLY, CORRECTION, STEERABLE_REPORT, CAPTURE_EPOCH] {
+		for other in [SYNC_REPLY, CORRECTION, STEERABLE_REPORT, CAPTURE_EPOCH, FRAME_SENT] {
 			assert_eq!(reply_to(other, 1, 2), None);
 		}
 	}

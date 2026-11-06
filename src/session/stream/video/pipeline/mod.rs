@@ -294,29 +294,38 @@ struct InFlightGuard(Arc<AtomicUsize>);
 /// limit.
 pub(super) struct PacketBatch {
 	epoch: u32,
+	frame_number: u32,
 	shards: ShardBatch,
 	in_flight: InFlightGuard,
 }
 
 impl PacketBatch {
 	/// Release the frame's in-flight slot and return the reset epoch the frame
-	/// was packetized in (see [`ConsumerMessage::ResetCounters`]) and its shards.
+	/// was packetized in (see [`ConsumerMessage::ResetCounters`]), its frame
+	/// number and its shards.
 	///
 	/// The slot is released here, when the sender dequeues the batch, not when
 	/// its shards are sent or leave the host.
-	pub(super) fn into_parts(self) -> (u32, ShardBatch) {
+	pub(super) fn into_parts(self) -> (u32, u32, ShardBatch) {
 		drop(self.in_flight);
-		(self.epoch, self.shards)
+		(self.epoch, self.frame_number, self.shards)
 	}
 
 	/// An empty batch holding a new in-flight slot, as the encoding thread and
 	/// the consumer would produce it.
 	#[cfg(test)]
 	pub(super) fn holding_slot(in_flight: &Arc<AtomicUsize>) -> Self {
+		Self::frame(0, ShardBatch::empty(), in_flight)
+	}
+
+	/// Frame `frame_number`'s shards, holding a new in-flight slot.
+	#[cfg(test)]
+	pub(super) fn frame(frame_number: u32, shards: ShardBatch, in_flight: &Arc<AtomicUsize>) -> Self {
 		in_flight.fetch_add(1, Ordering::Relaxed);
 		Self {
 			epoch: 0,
-			shards: ShardBatch::empty(),
+			frame_number,
+			shards,
 			in_flight: InFlightGuard(in_flight.clone()),
 		}
 	}
@@ -479,6 +488,7 @@ async fn run_packet_consumer(
 		// video-pipeline shutdown token and tears the session down.
 		let batch = PacketBatch {
 			epoch: reset_epoch,
+			frame_number,
 			shards,
 			in_flight: in_flight_slot,
 		};

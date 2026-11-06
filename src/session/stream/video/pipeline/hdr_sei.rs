@@ -301,7 +301,7 @@ fn find_first_frame_obu(data: &[u8]) -> usize {
 }
 
 /// Decode an unsigned LEB128 value. Returns (value, bytes consumed).
-fn leb128_decode(data: &[u8]) -> (u64, usize) {
+pub(super) fn leb128_decode(data: &[u8]) -> (u64, usize) {
 	let mut value: u64 = 0;
 	let mut shift = 0;
 	for (i, &byte) in data.iter().enumerate() {

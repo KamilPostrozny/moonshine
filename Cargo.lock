@@ -1314,7 +1314,7 @@ dependencies = [
 [[package]]
 name = "ferriscope"
 version = "0.1.0"
-source = "git+https://github.com/KamilPostrozny/ferriscope?rev=b5bbe42c810c77c6498ff538e19c91b85530340d#b5bbe42c810c77c6498ff538e19c91b85530340d"
+source = "git+https://github.com/KamilPostrozny/ferriscope?rev=1a59338e01afc0557dfa914ab13e9c9820e11975#1a59338e01afc0557dfa914ab13e9c9820e11975"
 dependencies = [
  "bitflags",
  "smithay",
@@ -3895,7 +3895,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",

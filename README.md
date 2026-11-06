@@ -162,7 +162,7 @@ sudo install -Dm644 dist/60-moonshine.rules /usr/lib/udev/rules.d/60-moonshine.r
 sudo udevadm control --reload-rules
 
 # Install ferriscope's Vulkan WSI layer for game rendering
-dist/install-wsi.sh   # builds as you, asks for sudo only to install
+dist/install-wsi.sh   # x86_64 and i686 layers; needs the i686 Rust target and lib32 glibc; sudo only to install
 ```
 
 Then run:

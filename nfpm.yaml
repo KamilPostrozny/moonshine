@@ -35,6 +35,10 @@ contents:
     dst: /usr/lib/ferriscope/libferriscope_wsi.so
   - src: ./target/wsi-stage/usr/share/vulkan/implicit_layer.d/VkLayer_FERRISCOPE_wsi.x86_64.json
     dst: /usr/share/vulkan/implicit_layer.d/VkLayer_FERRISCOPE_wsi.x86_64.json
+  - src: ./target/wsi-stage/usr/lib32/ferriscope/libferriscope_wsi.so
+    dst: /usr/lib32/ferriscope/libferriscope_wsi.so
+  - src: ./target/wsi-stage/usr/share/vulkan/implicit_layer.d/VkLayer_FERRISCOPE_wsi.i686.json
+    dst: /usr/share/vulkan/implicit_layer.d/VkLayer_FERRISCOPE_wsi.i686.json
   # License locations differ per distro.
   - src: ./LICENSE
     dst: /usr/share/licenses/moonshine/LICENSE

@@ -36,6 +36,8 @@ jobs:
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: i686-unknown-linux-gnu
 
     - name: Install dependencies
       uses: ./.github/actions/install-dependencies
@@ -44,11 +46,15 @@ jobs:
       run: cargo build --release --workspace
 
     - name: Build the WSI layer
-      run: DESTDIR=./target/wsi-stage ./dist/install-wsi.sh
+      # The 32-bit layer links with cc -m32.
+      run: |
+        sudo apt-get install -y gcc-multilib
+        DESTDIR=./target/wsi-stage ./dist/install-wsi.sh
 
     - name: Strip and fixup
       run: |
-        strip ./target/release/moonshine ./target/wsi-stage/usr/lib/ferriscope/libferriscope_wsi.so
+        strip ./target/release/moonshine ./target/wsi-stage/usr/lib/ferriscope/libferriscope_wsi.so \
+          ./target/wsi-stage/usr/lib32/ferriscope/libferriscope_wsi.so
         # Remove libunwind — pulled in transitively via libc++ on Ubuntu but
         # never called at runtime (no C++ exceptions in the code path).
         # Can be removed if inputtino-sys is changed to link -lc++ statically
@@ -65,7 +71,7 @@ jobs:
         STAGE="$RUNNER_TEMP/moonshine"
         mkdir -p "$STAGE/bin" "$STAGE/share/moonshine"
         cp ./target/release/moonshine "$STAGE/bin/"
-        cp -r ./target/wsi-stage/usr/lib ./target/wsi-stage/usr/share "$STAGE/"
+        cp -r ./target/wsi-stage/usr/lib ./target/wsi-stage/usr/lib32 ./target/wsi-stage/usr/share "$STAGE/"
         cp ./dist/start-moonshine.sh ./dist/60-moonshine.rules ./dist/50-moonshine-inhibit-sleep.rules \
            ./dist/moonshine-modules.conf ./dist/moonshine-sysusers.conf \
            ./dist/moonshine@.service \

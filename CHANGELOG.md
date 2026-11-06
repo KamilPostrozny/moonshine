@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Send a type-6 `FrameSent` latency message for every video frame written to the client: its frame number and when its socket writes started and ended, so the client can split each frame's arrival between the Host's send and the network.
 - Put the Stream's per-frame threads (ferriscope's compositor, the video pipeline and pixelforge's encode readback) on `SCHED_RR` priority 10 once the encoder exists, when `RLIMIT_RTPRIO` allows it, so a Game that saturates the CPU no longer delays them. Without the limit they keep their policy and a warning is logged.
 - Pin ferriscope at `d6b27e7` (`latency` with ticket 47): its WSI layer holds a Game in every present mode until the session's next tick, so a Game with VSync off (MAILBOX, IMMEDIATE) renders one frame per tick on the steered frame clock instead of unbounded. A Game can set `FERRISCOPE_WSI_HOLD=fifo` to hold FIFO only (the old behaviour) or `off`.
+- Install ferriscope's WSI layer for i686 too (`lib32/ferriscope/libferriscope_wsi.so`, `VkLayer_FERRISCOPE_wsi.i686.json`), so 32-bit Vulkan Games and 32-bit DXVK/vkd3d-proton take the Xwayland bypass and the present hold. Pin ferriscope at `1a59338`. `dist/install-wsi.sh` now needs the `i686-unknown-linux-gnu` Rust target and a 32-bit glibc, and fails without them; the release build, the tarball, the packages and `moonshine-install.sh` carry both layers.
 
 ### Fixed
 

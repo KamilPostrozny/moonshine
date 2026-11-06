@@ -153,6 +153,7 @@ if [[ "$UNINSTALL" == "true" ]]; then
   sudo rm -f /etc/sysusers.d/moonshine.conf
   sudo rm -f /etc/vulkan/implicit_layer.d/VkLayer_moonshine_wsi.json
   sudo rm -f /etc/vulkan/implicit_layer.d/VkLayer_FERRISCOPE_wsi.x86_64.json
+  sudo rm -f /etc/vulkan/implicit_layer.d/VkLayer_FERRISCOPE_wsi.i686.json
   sudo rm -f /etc/polkit-1/rules.d/50-moonshine-inhibit-sleep.rules
   sudo rm -f /etc/profile.d/moonshine.sh
   sudo rm -f /etc/atomic-update.conf.d/moonshine.conf
@@ -253,10 +254,12 @@ CMDS=(
   # Remove the moonshine-wsi layer of older releases; ferriscope-wsi replaces it
   "rm -f /etc/vulkan/implicit_layer.d/VkLayer_moonshine_wsi.json '${MOONSHINE_HOME}/lib/libmoonshine_wsi.so'"
 
-  # Deploy the ferriscope WSI layer; its manifest names the library under /usr,
-  # so point it at the copy here
+  # Deploy the ferriscope WSI layers (x86_64 and i686); their manifests name
+  # the libraries under /usr, so point them at the copies here
   "install -Dm755 '${S}/lib/ferriscope/libferriscope_wsi.so' '${MOONSHINE_HOME}/lib/ferriscope/libferriscope_wsi.so'"
   "sed 's|/usr/lib/ferriscope/|${MOONSHINE_HOME}/lib/ferriscope/|' '${S}/share/vulkan/implicit_layer.d/VkLayer_FERRISCOPE_wsi.x86_64.json' > /etc/vulkan/implicit_layer.d/VkLayer_FERRISCOPE_wsi.x86_64.json"
+  "install -Dm755 '${S}/lib32/ferriscope/libferriscope_wsi.so' '${MOONSHINE_HOME}/lib32/ferriscope/libferriscope_wsi.so'"
+  "sed 's|/usr/lib32/ferriscope/|${MOONSHINE_HOME}/lib32/ferriscope/|' '${S}/share/vulkan/implicit_layer.d/VkLayer_FERRISCOPE_wsi.i686.json' > /etc/vulkan/implicit_layer.d/VkLayer_FERRISCOPE_wsi.i686.json"
 
   # Deploy the install script itself for future upgrades/uninstall
   "cp '${S}/bin/moonshine-install.sh' '${MOONSHINE_HOME}/bin/moonshine-install.sh'"

@@ -4,18 +4,23 @@
 #   dist/install-wsi.sh [--prefix PREFIX]
 #
 # Builds the layer from the ferriscope revision in Cargo.lock, so the layer
-# matches the compositor linked into moonshine, and installs, under PREFIX
+# matches the compositor linked into moonshine, for x86_64 and i686 (32-bit
+# Vulkan games, 32-bit DXVK/vkd3d-proton), and installs, under PREFIX
 # (default /usr):
 #   PREFIX/lib/ferriscope/libferriscope_wsi.so
+#   PREFIX/lib32/ferriscope/libferriscope_wsi.so
 #   PREFIX/share/vulkan/implicit_layer.d/VkLayer_FERRISCOPE_wsi.x86_64.json
-# The manifest names the library by its final PREFIX path.
+#   PREFIX/share/vulkan/implicit_layer.d/VkLayer_FERRISCOPE_wsi.i686.json
+# Each manifest names its library by its final PREFIX path.
 #
 # Run it as your own user: it builds as you and uses sudo only to install into
 # a directory you cannot write. Packaging sets DESTDIR to install into a
 # staging directory instead of the system.
 #
 # FERRISCOPE_SRC overrides the ferriscope checkout (for a local ferriscope
-# that is not pushed yet). Needs cargo and jq.
+# that is not pushed yet). Needs cargo, jq, the i686-unknown-linux-gnu Rust
+# target and a 32-bit glibc for cc -m32 (Arch: lib32-rust-libs, lib32-glibc);
+# without the i686 toolchain it fails before installing anything.
 set -euo pipefail
 
 prefix=/usr

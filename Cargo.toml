@@ -46,7 +46,7 @@ fec-rs = "0.1.0"
 # for x86_64 and i686, a session teardown that leaves no Xwayland, socket or lock behind, and a
 # frame clock that a new consumer sends back to nominal with no shift pending. Reports the
 # compositor thread's ID (`Compositor::thread_id`) for real-time registration.
-ferriscope = { git = "https://github.com/KamilPostrozny/ferriscope", rev = "df8e2daeec317b1b0b623e15adc08769af5e8402", default-features = false }
+ferriscope = { git = "https://github.com/KamilPostrozny/ferriscope", rev = "5d44291663947da139fdcc5a499c2a828bbe528c", default-features = false }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 gethostname = "1.1.0"
 hex = "0.4.3"
@@ -73,7 +73,7 @@ pkcs8 = "0.11.0"
 # bitstream readback from cached host memory, its readback thread's ID
 # (`Encoder::readback_thread_id`) for real-time registration, and upstream's
 # `Encoder::repeat` (`3dfc229`), backported, for the idle keyframe.
-pixelforge = { git = "https://github.com/KamilPostrozny/pixelforge", rev = "e1411175e73db5f27fafd6065fce32725c90380e", features = ["dmabuf"] }
+pixelforge = { git = "https://github.com/KamilPostrozny/pixelforge", rev = "e4e9f26c6d6a87f49180b5b08455b53413113710", features = ["dmabuf"] }
 pulseaudio = "0.3.1"
 rcgen = "0.14.8"
 rsa = "0.9.10"
@@ -126,4 +126,4 @@ tempfile = "3.27.0"
 [patch.crates-io]
 # KamilPostrozny fork of tokio-enet 0.1.1: a lost reliable control message is resent after about one
 # round trip (C ENet's timeout), not after the 5 s floor.
-tokio-enet = { git = "https://github.com/KamilPostrozny/tokio-enet", rev = "9c0107ebe5a4c76292e97c2d85ada0c814e70e87" }
+tokio-enet = { git = "https://github.com/KamilPostrozny/tokio-enet", rev = "a41c32a1a6e902afe0bba92531f7ff49823a2be3" }

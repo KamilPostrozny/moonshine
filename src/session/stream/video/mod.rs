@@ -520,27 +520,46 @@ fn spawn_send_thread(
 	resume_pending: Arc<AtomicBool>,
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
 ) -> Result<tokio::runtime::Handle, ()> {
-	let runtime = tokio::runtime::Builder::new_current_thread()
-		.enable_all()
-		.build()
-		.map_err(|e| tracing::error!("Failed to build the video send runtime: {e}"))?;
-	let handle = runtime.handle().clone();
-	std::thread::Builder::new()
-		.name(SEND_THREAD.to_string())
+	spawn_runtime_thread(std::thread::Builder::new().name(SEND_THREAD.to_string()), move || {
+		let _ = crate::session::realtime::register_current(SEND_THREAD);
+		handle_video_packets(
+			packet_rx,
+			socket,
+			start,
+			reset_tx,
+			frame_sent_tx,
+			resume_pending,
+			stop_session_manager,
+		)
+	})
+}
+
+/// Starts `thread` running `run`'s future on a current-thread runtime of its own, and returns the
+/// runtime's handle, which runs tasks spawned on it on that thread. The runtime is built on that
+/// thread: built here, on a tokio worker, it would be dropped here when the spawn fails, which
+/// tokio turns into a panic.
+fn spawn_runtime_thread<F, Fut>(thread: std::thread::Builder, run: F) -> Result<tokio::runtime::Handle, ()>
+where
+	F: FnOnce() -> Fut + Send + 'static,
+	Fut: Future<Output = ()>,
+{
+	let (handle_tx, handle_rx) = std::sync::mpsc::sync_channel(1);
+	thread
 		.spawn(move || {
-			let _ = crate::session::realtime::register_current(SEND_THREAD);
-			runtime.block_on(handle_video_packets(
-				packet_rx,
-				socket,
-				start,
-				reset_tx,
-				frame_sent_tx,
-				resume_pending,
-				stop_session_manager,
-			));
+			let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+				Ok(runtime) => runtime,
+				Err(e) => {
+					tracing::error!("Failed to build the video send runtime: {e}");
+					return;
+				},
+			};
+			if handle_tx.send(runtime.handle().clone()).is_ok() {
+				runtime.block_on(run());
+			}
 		})
 		.map_err(|e| tracing::error!("Failed to start the video send thread: {e}"))?;
-	Ok(handle)
+	// Only as long as building the runtime takes; a runtime that failed to build drops the sender.
+	handle_rx.recv().map_err(|_| ())
 }
 
 async fn handle_video_packets(
@@ -662,6 +681,31 @@ async fn handle_video_packets(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[tokio::test]
+	async fn a_send_thread_that_cannot_start_is_an_error() {
+		// A stack larger than the address space: the spawn itself fails.
+		let thread = std::thread::Builder::new().stack_size(1 << 62);
+		assert!(spawn_runtime_thread(thread, || async {}).is_err());
+	}
+
+	#[test]
+	fn the_send_threads_handle_runs_tasks_on_that_thread() {
+		let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+		let thread = std::thread::Builder::new().name("send-test".to_string());
+		let handle = spawn_runtime_thread(thread, move || async move {
+			let _ = stop_rx.await;
+		})
+		.unwrap();
+
+		let (name_tx, name_rx) = std::sync::mpsc::channel();
+		handle.spawn(async move {
+			let _ = name_tx.send(std::thread::current().name().map(str::to_owned));
+		});
+		let name = name_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+		assert_eq!(name.as_deref(), Some("send-test"));
+		stop_tx.send(()).unwrap();
+	}
 
 	#[tokio::test]
 	async fn shutdown_before_start_releases_packet_handler() {

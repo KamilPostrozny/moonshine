@@ -201,6 +201,24 @@ struct BenchmarkReport {
 	codec: String,
 	summary: Option<StatsSummary>,
 	interrupted: bool,
+	/// Whether `stop_session` returned success.
+	stopped: bool,
+}
+
+impl BenchmarkReport {
+	/// Why this session fails the teardown check (`--sessions`), if it does: a session that
+	/// encoded nothing or didn't stop proves nothing about what stopping releases.
+	fn teardown_failure(&self) -> Option<&'static str> {
+		if self.interrupted {
+			Some("it was interrupted")
+		} else if !self.stopped {
+			Some("it failed to stop")
+		} else if self.summary.is_none() {
+			Some("it encoded no frames")
+		} else {
+			None
+		}
+	}
 }
 
 struct MatrixReport {
@@ -485,8 +503,10 @@ async fn run_sessions(args: &Args, count: u32) -> Result<(), Box<dyn std::error:
 	for session in 1..=count {
 		tracing::info!("Teardown check: session {session} of {count}");
 		let report = run_benchmark(args, "", &args.resolution, args.fps, &args.codec, duration).await?;
-		if report.interrupted {
-			return Err(boxed_error("Teardown check interrupted"));
+		if let Some(failure) = report.teardown_failure() {
+			return Err(boxed_error(format!(
+				"Teardown check failed: session {session} of {count}: {failure}"
+			)));
 		}
 		tracing::info!(
 			"Teardown check: after session {session}, VRAM {} KiB",
@@ -837,7 +857,10 @@ async fn run_benchmark(
 	};
 
 	tracing::info!("Stopping session...");
-	let _ = session_manager.stop_session().await;
+	let stopped = session_manager.stop_session().await.is_ok();
+	if !stopped {
+		tracing::error!("Failed to stop the session.");
+	}
 
 	tracing::info!("Done.");
 	Ok(BenchmarkReport {
@@ -847,6 +870,7 @@ async fn run_benchmark(
 		codec: codec.to_string(),
 		summary,
 		interrupted,
+		stopped,
 	})
 }
 
@@ -1005,7 +1029,7 @@ mod timing_tests {
 	use super::{FrameStats, StatsAccumulator};
 	use std::time::Duration;
 
-	fn frame(gpu_encode: Option<Duration>, bitstream_ready: Option<Duration>) -> FrameStats {
+	pub(super) fn frame(gpu_encode: Option<Duration>, bitstream_ready: Option<Duration>) -> FrameStats {
 		FrameStats {
 			channel_wait: Duration::ZERO,
 			import: Duration::ZERO,
@@ -1070,5 +1094,42 @@ mod timing_tests {
 		assert_eq!(gpu.avg_us, 1400.0);
 		let ready = summary.bitstream_ready.expect("one bitstream timing sample");
 		assert_eq!(ready.p50_us, 2700);
+	}
+}
+
+#[cfg(test)]
+mod teardown_tests {
+	use super::timing_tests::frame;
+	use super::{BenchmarkReport, StatsAccumulator};
+
+	fn report(frames: usize, stopped: bool) -> BenchmarkReport {
+		let mut accumulator = StatsAccumulator::new();
+		for _ in 0..frames {
+			accumulator.add(&frame(None, None));
+		}
+		BenchmarkReport {
+			resolution_label: "",
+			resolution: "1920x1080".to_string(),
+			target_fps: 60,
+			codec: "hevc".to_string(),
+			summary: accumulator.summary(),
+			interrupted: false,
+			stopped,
+		}
+	}
+
+	#[test]
+	fn a_session_that_encoded_and_stopped_passes() {
+		assert_eq!(report(3, true).teardown_failure(), None);
+	}
+
+	#[test]
+	fn a_session_that_failed_to_stop_fails_the_teardown_check() {
+		assert_eq!(report(3, false).teardown_failure(), Some("it failed to stop"));
+	}
+
+	#[test]
+	fn a_session_that_encoded_nothing_fails_the_teardown_check() {
+		assert_eq!(report(0, true).teardown_failure(), Some("it encoded no frames"));
 	}
 }

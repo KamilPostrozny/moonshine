@@ -116,6 +116,11 @@ const _: () = assert!(STOP_JOB_TIMEOUT.as_secs() > STOP_TIMEOUT.as_secs());
 
 const UNIT_REMOVED_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// The longest a dropped `Application` takes to stop its unit: the stop job, then the unit's
+/// removal. The compositor stays that long after a session's stop.
+pub(crate) const GAME_STOP_TIMEOUT: Duration =
+	Duration::from_secs(STOP_JOB_TIMEOUT.as_secs() + UNIT_REMOVED_TIMEOUT.as_secs());
+
 /// Variables of the desktop session that the user manager passes to every unit it starts: the
 /// desktop compositor's displays and IPC sockets, and the desktop's identity. The Game's unit
 /// unsets the ones Moonshine doesn't set itself, so a Stream Game can't reach the desktop's
@@ -187,9 +192,9 @@ pub(crate) struct Application {
 	unit_name: String,
 	config: ApplicationConfig,
 	exit_monitor: Option<JoinHandle<()>>,
-	/// Dropped only after `drop` has stopped the unit: its receiver (the compositor) then knows
-	/// the Game no longer needs its display.
-	_unit_stopped: oneshot::Sender<()>,
+	/// Dropped only once the unit has stopped, after `drop`: its receiver (the compositor) then
+	/// knows the Game no longer needs its display.
+	unit_stopped: Option<oneshot::Sender<()>>,
 }
 
 impl Application {
@@ -247,7 +252,7 @@ impl Application {
 			unit_name: context.unit_name,
 			config,
 			exit_monitor: Some(exit_monitor),
-			_unit_stopped: unit_stopped,
+			unit_stopped: Some(unit_stopped),
 		})
 	}
 }
@@ -259,14 +264,35 @@ impl Drop for Application {
 			handle.abort();
 		}
 
-		// Unfortunately we have no `drop_async` yet, so we must spawn an async runtime to call stop_unit.
+		let Some(unit_stopped) = self.unit_stopped.take() else {
+			return;
+		};
+		// Unfortunately we have no `drop_async` yet, so the stop gets a runtime of its own. It runs
+		// on its own thread: a Steam's shutdown takes up to `STEAM_STOP_TIMEOUT`, and the session
+		// manager drops sessions on its async workers.
 		let unit_name = self.unit_name.clone();
-		std::thread::spawn(move || {
-			let rt = tokio::runtime::Runtime::new().unwrap();
-			rt.block_on(stop_unit_owned(unit_name)).ok();
-		})
-		.join()
-		.unwrap();
+		stop_in_background(unit_stopped, move || match tokio::runtime::Runtime::new() {
+			Ok(rt) => {
+				rt.block_on(stop_unit_owned(unit_name)).ok();
+			},
+			Err(e) => tracing::error!("Failed to build a runtime to stop the Game's unit: {e}"),
+		});
+	}
+}
+
+/// Runs `stop` on a thread of its own and drops `unit_stopped` once it has returned. Returns at
+/// once.
+fn stop_in_background(unit_stopped: oneshot::Sender<()>, stop: impl FnOnce() + Send + 'static) {
+	let spawned = std::thread::Builder::new()
+		.name("game-stop".to_string())
+		.spawn(move || {
+			stop();
+			drop(unit_stopped);
+		});
+	// The closure, `unit_stopped` with it, is dropped: the compositor stops now, and the next
+	// launch stops the leftover unit before it starts its own.
+	if let Err(e) = spawned {
+		tracing::error!("Failed to start a thread to stop the Game's unit: {e}");
 	}
 }
 
@@ -959,11 +985,31 @@ fn build_exec_array(entries: &[(String, Vec<String>, bool)]) -> Result<zvariant:
 mod tests {
 	use super::{
 		ApplicationConfig, ApplicationContext, LaunchOptions, UnitCommands, make_envs, split_standard_io,
-		steam_shutdown_entry, unit_properties,
+		steam_shutdown_entry, stop_in_background, unit_properties,
 	};
 	use std::collections::{BTreeMap, HashMap};
 	use std::path::PathBuf;
 	use std::time::Duration;
+
+	#[test]
+	fn stopping_a_game_returns_at_once_and_reports_the_stop_once_it_has_finished() {
+		let (unit_stopped, mut stopped) = tokio::sync::oneshot::channel::<()>();
+		let (finish, finished) = std::sync::mpsc::channel::<()>();
+		stop_in_background(unit_stopped, move || {
+			let _ = finished.recv_timeout(Duration::from_secs(5));
+		});
+		assert_eq!(
+			stopped.try_recv(),
+			Err(tokio::sync::oneshot::error::TryRecvError::Empty),
+			"the caller has control back while the Game's unit is still stopping"
+		);
+
+		finish.send(()).unwrap();
+		assert!(
+			stopped.blocking_recv().is_err(),
+			"`unit_stopped` goes once the stop has returned"
+		);
+	}
 
 	#[test]
 	fn test_steam_integration_defaults_to_off() {

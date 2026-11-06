@@ -296,8 +296,7 @@ pub(super) fn handle_command(
 						// pop_missing with in_prebuf=true bypasses the min_req gate,
 						// ensuring an immediate REQUEST even when missing < min_req.
 						let req = pop_missing(&mut stream.missing, &mut stream.requested, min_req, true);
-
-						stream.state = if req > 0 {
+						if req > 0 {
 							pulse::write_command_message(
 								&mut ClientWriter(&mut client.outgoing),
 								u32::MAX,
@@ -307,7 +306,14 @@ pub(super) fn handle_command(
 								}),
 								client.protocol_version,
 							)?;
-							StreamState::Prebuffering(req as u64)
+						}
+
+						// Playback resumes once one pre-buffering's worth is queued (PA counts
+						// what is already queued), as at the stream's start and after an
+						// underrun; the request above refills the whole target.
+						let needed = (stream.buffer_attr.pre_buffering as usize).saturating_sub(buf_len);
+						stream.state = if needed > 0 {
+							StreamState::Prebuffering(needed as u64)
 						} else {
 							StreamState::Playing
 						};

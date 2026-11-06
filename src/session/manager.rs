@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_shutdown::ShutdownManager;
 use tokio::sync::{Mutex, broadcast, watch};
@@ -11,6 +12,7 @@ use crate::session::SessionKeyData;
 use crate::session::SessionKeys;
 use crate::session::SessionKeysSender;
 use crate::session::SessionState;
+use crate::session::application::GAME_STOP_TIMEOUT;
 use crate::session::compositor::CompositorConfig;
 use crate::session::stream::StartSignal;
 use crate::session::stream::audio::AudioStreamConfig;
@@ -19,7 +21,11 @@ use crate::session::stream::control::ControlStreamConfig;
 use crate::session::stream::video::VideoStreamConfig;
 use crate::session::stream::video::VideoStreamContext;
 
-const SESSION_SHUTDOWN_TIMEOUT_SECS: u64 = 10;
+/// How long a stopped session gets to finish: its compositor stays until the Game's unit has
+/// stopped, which takes up to `GAME_STOP_TIMEOUT` (a Steam's own shutdown), then the compositor
+/// and the streams wind down.
+const SESSION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(GAME_STOP_TIMEOUT.as_secs() + 10);
+const _: () = assert!(SESSION_SHUTDOWN_TIMEOUT.as_secs() > GAME_STOP_TIMEOUT.as_secs());
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionShutdownReason {
@@ -75,6 +81,11 @@ struct SessionManagerInner {
 	/// Shutdown manager for the active session, used to trigger session shutdown upon request.
 	stop: ShutdownManager<SessionShutdownReason>,
 
+	/// Shutdown manager of the last session taken out of the manager. Until it completes, that
+	/// session's compositor is still up, waiting for its Game's unit to stop: a new session waits
+	/// for it, since its Game would take the same unit.
+	stopping: Option<ShutdownManager<SessionShutdownReason>>,
+
 	/// Sender for session keys, used to update keys from the webserver in different subsystems.
 	///
 	/// Subsystems that get updated are: video encoder, audio encoder and input handler.
@@ -114,18 +125,25 @@ struct SessionManagerInner {
 }
 
 impl SessionManagerInner {
-	fn reset_session(&mut self) {
+	/// Resets the manager's session state and hands back the session, which the caller drops
+	/// after releasing the lock.
+	#[must_use = "drop the session after releasing the lock"]
+	fn reset_session(&mut self) -> Option<SessionState> {
 		if let Some(handle) = self.stop_watcher.take() {
 			handle.abort();
 		}
-		self.session = None;
 		self.keys_tx = None;
 		self.video_stream_context = None;
 		self.audio_stream_context = None;
 		self.latency_protocol = false;
 		self.video_start = None;
 		self.audio_start = None;
-		self.stop = ShutdownManager::new();
+		let stop = std::mem::replace(&mut self.stop, ShutdownManager::new());
+		let session = self.session.take();
+		if session.is_some() {
+			self.stopping = Some(stop);
+		}
+		session
 	}
 }
 
@@ -136,8 +154,8 @@ impl Drop for SessionManagerInner {
 		}
 		if self.session.is_some() {
 			tracing::debug!("Stopping active session before shutdown.");
-			// Drop the session first, as `stop_session` does: that stops the Game's unit, which the
-			// compositor waits for before the session's shutdown can complete.
+			// Drop the session first, as `stop_session` does: that starts the Game unit's stop,
+			// which the compositor waits for before the session's shutdown can complete.
 			self.session = None;
 			let _ = self.stop.trigger_shutdown(SessionShutdownReason::ManagerShutdown);
 			// Wait until shutdown completed.
@@ -181,6 +199,7 @@ impl SessionManager {
 			inhibit_sleep,
 			session: None,
 			stop: ShutdownManager::new(),
+			stopping: None,
 			keys_tx: None,
 			video_stream_context: None,
 			audio_stream_context: None,
@@ -272,7 +291,17 @@ impl SessionManager {
 	///
 	/// The session is not launched until `launch_session` is called.
 	pub async fn initialize_session(&self, mut context: SessionContext) -> Result<(), ()> {
+		let previous = self.inner.lock().await.stopping.clone();
+		wait_for_previous_session(previous, SESSION_SHUTDOWN_TIMEOUT).await?;
+
 		let mut guard = self.inner.lock().await;
+		if guard
+			.stopping
+			.as_ref()
+			.is_some_and(ShutdownManager::is_shutdown_completed)
+		{
+			guard.stopping = None;
+		}
 
 		if guard.session.is_some() || guard.keys_tx.is_some() {
 			tracing::warn!("Session already initialized, rejecting InitializeSession command.");
@@ -351,7 +380,7 @@ impl SessionManager {
 			},
 			Err(()) => {
 				let mut guard = self.inner.lock().await;
-				guard.reset_session();
+				let _ = guard.reset_session();
 				tracing::error!("Failed to launch session, waiting for new session.");
 				Err(())
 			},
@@ -433,7 +462,7 @@ impl SessionManager {
 				Ok(())
 			},
 			Err(()) => {
-				guard.reset_session();
+				let _ = guard.reset_session();
 				tracing::error!("Failed to start session streams.");
 				Err(())
 			},
@@ -442,24 +471,30 @@ impl SessionManager {
 
 	/// Stop the session and return to Uninitialized state.
 	pub async fn stop_session(&self) -> Result<(), ()> {
-		let (stop, shutdown) = {
+		let (session, stop, shutdown) = {
 			let mut guard = self.inner.lock().await;
-			match guard.session {
-				Some(_) => {},
-				None => return Ok(()),
+			if guard.session.is_none() {
+				return Ok(());
 			}
 			let stop = guard.stop.clone();
 			let shutdown = guard.shutdown.clone();
-
-			// Drop session first, which drops the Application.
-			guard.reset_session();
-			(stop, shutdown)
+			(guard.reset_session(), stop, shutdown)
 		};
+		// Hold the application's shutdown until the Game has stopped (see the watchdog).
+		let delay = shutdown
+			.delay_shutdown_token()
+			.inspect_err(|e| tracing::warn!("Failed to delay shutdown for the session's stop: {e:?}"))
+			.ok();
 
-		// Then trigger shutdown of the compositor & streams.
+		// Drop the session first, outside the lock: that starts the Game unit's stop (which takes
+		// a Steam's whole shutdown) on a thread of its own, and the compositor stays until it has
+		// stopped. Then trigger shutdown of the compositor & streams.
+		drop(session);
 		let _ = stop.trigger_shutdown(SessionShutdownReason::UserStopped);
 
-		wait_for_session_shutdown(&stop, &shutdown, SESSION_SHUTDOWN_TIMEOUT_SECS).await?;
+		let result = wait_for_session_shutdown(&stop, &shutdown, SESSION_SHUTDOWN_TIMEOUT).await;
+		drop(delay);
+		result?;
 		tracing::info!("Session stopped by user, waiting for new session.");
 		Ok(())
 	}
@@ -522,23 +557,26 @@ fn spawn_session_watchdog(inner: &Arc<Mutex<SessionManagerInner>>, guard: &mut S
 			},
 		}
 
-		// First drop the session so that the application exits as soon as possible.
-		// `reset_session` aborts the watchdog's handle, and this task is the
+		// First drop the session, outside the lock, so that the application exits as soon as
+		// possible. `reset_session` aborts the watchdog's handle, and this task is the
 		// watchdog: detach the handle first, or the abort would cancel the wait
 		// below.
-		{
+		let session = {
 			let mut guard = inner.lock().await;
 			drop(guard.stop_watcher.take());
-			guard.reset_session();
-		}
+			guard.reset_session()
+		};
+		drop(session);
 
 		// Then wait for the session to shut down.
-		let timeout = std::time::Duration::from_secs(SESSION_SHUTDOWN_TIMEOUT_SECS);
-		if tokio::time::timeout(timeout, stop.wait_shutdown_complete())
+		if tokio::time::timeout(SESSION_SHUTDOWN_TIMEOUT, stop.wait_shutdown_complete())
 			.await
 			.is_err()
 		{
-			tracing::error!("Session shutdown timed out after {SESSION_SHUTDOWN_TIMEOUT_SECS}s.");
+			tracing::error!(
+				"Session shutdown timed out after {}s.",
+				SESSION_SHUTDOWN_TIMEOUT.as_secs()
+			);
 		}
 		drop(delay);
 	});
@@ -552,19 +590,97 @@ fn spawn_session_watchdog(inner: &Arc<Mutex<SessionManagerInner>>, guard: &mut S
 async fn wait_for_session_shutdown(
 	stop: &ShutdownManager<SessionShutdownReason>,
 	shutdown: &ShutdownManager<ShutdownReason>,
-	timeout_secs: u64,
+	timeout: Duration,
 ) -> Result<(), ()> {
-	match tokio::time::timeout(
-		std::time::Duration::from_secs(timeout_secs),
-		stop.wait_shutdown_complete(),
-	)
-	.await
-	{
+	match tokio::time::timeout(timeout, stop.wait_shutdown_complete()).await {
 		Ok(_) => Ok(()),
 		Err(_) => {
-			tracing::error!("Session shutdown timed out after {timeout_secs}s — triggering application shutdown.");
+			tracing::error!(
+				"Session shutdown timed out after {}s — triggering application shutdown.",
+				timeout.as_secs()
+			);
 			let _ = shutdown.trigger_shutdown(ShutdownReason::SessionManagerShutdown);
 			Err(())
 		},
+	}
+}
+
+/// Waits, up to `timeout`, for the session taken out before (`previous`) to finish stopping:
+/// until then its compositor is up, waiting for its Game's unit to stop (a Steam's own shutdown),
+/// and a new session's Game would take the same unit.
+async fn wait_for_previous_session(
+	previous: Option<ShutdownManager<SessionShutdownReason>>,
+	timeout: Duration,
+) -> Result<(), ()> {
+	let Some(previous) = previous else {
+		return Ok(());
+	};
+	if !previous.is_shutdown_completed() {
+		tracing::info!("Waiting for the previous session to stop before starting a new one.");
+	}
+	match tokio::time::timeout(timeout, previous.wait_shutdown_complete()).await {
+		Ok(_) => Ok(()),
+		Err(_) => {
+			tracing::warn!(
+				"The previous session is still stopping after {}s, rejecting InitializeSession command.",
+				timeout.as_secs()
+			);
+			Err(())
+		},
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// A stopped session whose compositor still waits for its Game's unit to stop.
+	fn stopping_session() -> (
+		ShutdownManager<SessionShutdownReason>,
+		async_shutdown::DelayShutdownToken<SessionShutdownReason>,
+	) {
+		let stop = ShutdownManager::new();
+		let compositor = stop.delay_shutdown_token().unwrap();
+		stop.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
+		(stop, compositor)
+	}
+
+	#[tokio::test]
+	async fn a_new_session_waits_until_the_previous_one_has_stopped() {
+		let (previous, compositor) = stopping_session();
+		let wait = tokio::spawn(wait_for_previous_session(Some(previous), Duration::from_secs(5)));
+		tokio::task::yield_now().await;
+		assert!(!wait.is_finished(), "the previous Game is still stopping");
+
+		drop(compositor);
+		assert_eq!(wait.await.unwrap(), Ok(()));
+	}
+
+	#[tokio::test]
+	async fn a_previous_session_not_yet_told_to_stop_is_waited_for_too() {
+		let previous = ShutdownManager::new();
+		let wait = tokio::spawn(wait_for_previous_session(
+			Some(previous.clone()),
+			Duration::from_secs(5),
+		));
+		tokio::task::yield_now().await;
+		assert!(!wait.is_finished(), "taken out, but its shutdown isn't triggered yet");
+
+		previous.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
+		assert_eq!(wait.await.unwrap(), Ok(()));
+	}
+
+	#[tokio::test]
+	async fn a_new_session_is_refused_while_the_previous_one_is_still_stopping() {
+		let (previous, _compositor) = stopping_session();
+		assert_eq!(
+			wait_for_previous_session(Some(previous), Duration::from_millis(50)).await,
+			Err(())
+		);
+	}
+
+	#[tokio::test]
+	async fn with_no_previous_session_a_new_one_starts_at_once() {
+		assert_eq!(wait_for_previous_session(None, Duration::ZERO).await, Ok(()));
 	}
 }

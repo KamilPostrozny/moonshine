@@ -71,7 +71,9 @@ async fn main() -> Result<(), ()> {
 	tracing::debug!("Using configuration:\n{:#?}", config);
 
 	tracing::debug!("Waiting for D-Bus session bus...");
-	wait_for_dbus().await?;
+	if !wait_for_dbus().await? {
+		return Ok(());
+	}
 	tracing::debug!("D-Bus session bus available.");
 
 	// Run health checks unless the user explicitly disabled them.
@@ -142,9 +144,9 @@ async fn main() -> Result<(), ()> {
 	shutdown.wait_shutdown_triggered().await;
 	drop(moonshine);
 
-	let exit_code = shutdown.wait_shutdown_complete().await;
+	let reason = shutdown.wait_shutdown_complete().await;
 	tracing::debug!("Successfully waited for shutdown to complete.");
-	std::process::exit(exit_code as i32);
+	std::process::exit(reason.exit_code());
 }
 
 fn init_tracing() {
@@ -154,7 +156,8 @@ fn init_tracing() {
 		.init();
 }
 
-async fn wait_for_dbus() -> Result<(), ()> {
+/// Wait for the session bus: `false` when SIGTERM or SIGINT asked Moonshine to quit first.
+async fn wait_for_dbus() -> Result<bool, ()> {
 	let mut terminate =
 		signal(SignalKind::terminate()).map_err(|e| tracing::error!("Failed to bind to SIGTERM signal: {e}"))?;
 	let mut interrupt =
@@ -164,16 +167,16 @@ async fn wait_for_dbus() -> Result<(), ()> {
 		tokio::select! {
 			_ = terminate.recv() => {
 				tracing::info!("Received SIGTERM while waiting for D-Bus, exiting.");
-				return Err(());
+				return Ok(false);
 			},
 			_ = interrupt.recv() => {
 				tracing::info!("Received SIGINT while waiting for D-Bus, exiting.");
-				return Err(());
+				return Ok(false);
 			},
 			res = zbus::Connection::session() => {
 				match res {
 					Ok(_conn) => {
-						return Ok(())
+						return Ok(true)
 					},
 					Err(e) => {
 						tracing::warn!("Failed to connect to D-Bus session bus: {e}. Retrying in 20 seconds...");

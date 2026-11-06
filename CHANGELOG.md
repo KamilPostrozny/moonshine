@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Recover a lost frame by reference frame invalidation instead of an IDR. A client that sends `maxNumReferenceFrames=0` ("the codec's maximum", every RFI-capable Moonlight) gets pixelforge's default window of 4 references instead of 1. Pin pixelforge to `KamilPostrozny/pixelforge` at `4262658` (v0.10.0 plus upstream `f046afe`), which keeps that window when the device predicts each frame from one reference (RADV HEVC and AV1).
+- Mark the first frame after a reference frame invalidation as a recovery frame (frame header type 5, as Sunshine does). Moonlight drops every frame after a loss until a key or recovery frame arrives, so without the mark each invalidation still ended in a one-second stall and the IDR Moonlight requests after it.
 - A reconnecting client's first steerable report no longer acknowledges the previous client's last correction, and corrections the previous client left queued are dropped (ferriscope `FrameClockSender::new_consumer`).
 - Pin ferriscope at `4b52cc2`: a correction queued for one second or longer (a stalled compositor) is dropped instead of installed as fresh, and a Steam FPS cap at the session rate no longer skips a callback when the grid is steered earlier.
 - The colour conversion and the encode are chained on the GPU (`convert_async` + `encode_after`): the encode is submitted while the conversion runs instead of after the CPU saw it finish. The frame still goes back to the compositor only once the conversion has read it.

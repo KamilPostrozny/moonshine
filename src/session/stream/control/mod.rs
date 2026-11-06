@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio_enet::{Event, Host, HostConfig, Packet, PacketMode, PeerState};
 
+use self::client::{ClientPeer, Sender};
 use self::input::gamepad::GamepadConfig;
 use self::{feedback::FeedbackCommand, input::InputHandler};
 use crate::crypto::{decrypt, encrypt};
@@ -22,6 +23,7 @@ use crate::session::manager::SessionShutdownReason;
 use crate::session::stream::StartSignal;
 use crate::session::stream::video::{FrameSent, RTP_CLOCK_RATE, VideoStreamHandle};
 
+mod client;
 mod feedback;
 pub(crate) mod input;
 
@@ -168,6 +170,10 @@ impl<'a> ControlMessage<'a> {
 			ControlMessageType::LossStats => Ok(Self::LossStats),
 			ControlMessageType::FrameStats => Ok(Self::FrameStats),
 			ControlMessageType::InputData => {
+				if buffer.len() < 8 {
+					tracing::warn!("Input event message of {} bytes has no length.", buffer.len());
+					return Err(());
+				}
 				// Length of the input event, excluding the length itself.
 				let length = u32::from_be_bytes(buffer[4..8].try_into().unwrap());
 				if length as usize != buffer.len() - 8 {
@@ -524,8 +530,8 @@ async fn run_control_loop(
 	let mut sequence_number = 0u32;
 	let mut send_hdr_mode = false;
 	let mut audio_triggered = false;
-	// Track which peer slot the client is connected to.
-	let mut connected_peer: Option<tokio_enet::PeerId> = None;
+	// Which peer is the client: the last one whose message decrypted under the Stream's key.
+	let mut client = ClientPeer::default();
 	// Whether the connected client has the capture epoch of the video RTP timestamps.
 	let mut capture_epoch_sent = false;
 	let mut latency_client_ready = false;
@@ -548,7 +554,7 @@ async fn run_control_loop(
 
 		// Check for feedback messages.
 		if let Ok(command) = feedback_rx.try_recv()
-			&& let Some(peer_id) = connected_peer
+			&& let Some(peer_id) = client.peer()
 		{
 			tracing::debug!("Sending control feedback command: {command:?}");
 			let payload = command.as_packet();
@@ -563,23 +569,22 @@ async fn run_control_loop(
 			.map_err(|e| tracing::error!("Failure in enet host: {e}"))
 		{
 			Ok(Some(Event::Connect { peer_id, .. })) => {
-				connected_peer = Some(peer_id);
-				capture_epoch_sent = false;
-				latency_client_ready = false;
-				last_clock_report = None;
-				frame_clock.new_client();
+				tracing::debug!("Control stream: peer {peer_id} connected.");
+				client.connected(peer_id);
 			},
 			Ok(Some(Event::Disconnect { peer_id, .. })) => {
-				if connected_peer == Some(peer_id) {
-					connected_peer = None;
-				}
+				tracing::debug!("Control stream: peer {peer_id} disconnected.");
+				client.disconnected(peer_id);
 			},
-			Ok(Some(Event::Receive { ref packet, .. })) => {
+			Ok(Some(Event::Receive {
+				peer_id, ref packet, ..
+			})) => {
 				// Before decrypting: a clock-sync request's host receive time.
 				let received_at = std::time::Instant::now();
 				let mut control_message = match ControlMessage::from_bytes(packet.data()) {
 					Ok(control_message) => control_message,
-					Err(()) => break,
+					Err(()) if client.peer() == Some(peer_id) => break,
+					Err(()) => continue,
 				};
 				tracing::trace!("Received control message: {control_message:?}");
 
@@ -603,6 +608,21 @@ async fn run_control_loop(
 					};
 
 					tracing::trace!("Decrypted control message: {control_message:?}");
+				}
+
+				match client.received(peer_id, encrypted) {
+					Sender::Client => {},
+					Sender::NewClient => {
+						tracing::info!("Control stream: peer {peer_id} is the client.");
+						capture_epoch_sent = false;
+						latency_client_ready = false;
+						last_clock_report = None;
+						frame_clock.new_client();
+					},
+					Sender::Stranger => {
+						tracing::debug!("Ignoring a control message from peer {peer_id}, not the client.");
+						continue;
+					},
 				}
 
 				match control_message {
@@ -666,7 +686,7 @@ async fn run_control_loop(
 
 		// Answer a clock-sync request with the host's receive and send times.
 		if let Some((request, host_received)) = clock_sync_request
-			&& let Some(peer_id) = connected_peer
+			&& let Some(peer_id) = client.peer()
 		{
 			let key = context.keys_rx.borrow().remote_input_key.clone();
 			let host_sent = latency_protocol::monotonic_ns(std::time::Instant::now());
@@ -682,7 +702,7 @@ async fn run_control_loop(
 		if context.latency_protocol
 			&& !capture_epoch_sent
 			&& clock_sync_request.is_some()
-			&& let Some(peer_id) = connected_peer
+			&& let Some(peer_id) = client.peer()
 			&& let Some(epoch) = video_handle.rtp_epoch()
 		{
 			let key = context.keys_rx.borrow().remote_input_key.clone();
@@ -701,11 +721,11 @@ async fn run_control_loop(
 		let report = frame_clock.report();
 		if latency_client_ready
 			&& last_clock_report != Some(report)
-			&& let Some(peer_id) = connected_peer
+			&& let Some(peer_id) = client.peer()
 		{
 			let key = context.keys_rx.borrow().remote_input_key.clone();
 			send_latency_message(&mut host, peer_id, &key, &mut sequence_number, &report);
-			tracing::info!("Latency protocol: frame clock {report:?}");
+			tracing::debug!("Latency protocol: frame clock {report:?}");
 			last_clock_report = Some(report);
 		}
 
@@ -722,7 +742,7 @@ async fn run_control_loop(
 				},
 				Err(TryRecvError::Empty | TryRecvError::Closed) => break,
 			};
-			if latency_client_ready && let Some(peer_id) = connected_peer {
+			if latency_client_ready && let Some(peer_id) = client.peer() {
 				let key = key.get_or_insert_with(|| context.keys_rx.borrow().remote_input_key.clone());
 				send_latency_message(
 					&mut host,
@@ -737,7 +757,7 @@ async fn run_control_loop(
 		// Send HDR mode notification after the host.service() match to avoid double mutable borrow.
 		if send_hdr_mode {
 			send_hdr_mode = false;
-			if let Some(peer_id) = connected_peer {
+			if let Some(peer_id) = client.peer() {
 				let state = hdr_metadata_rx.borrow_and_update().clone();
 				let key = context.keys_rx.borrow().remote_input_key.clone();
 				tracing::info!("Informing client: HDR session");
@@ -748,7 +768,7 @@ async fn run_control_loop(
 		// Check for HDR metadata updates from the video pipeline.
 		if context.hdr
 			&& hdr_metadata_rx.has_changed().unwrap_or(false)
-			&& let Some(peer_id) = connected_peer
+			&& let Some(peer_id) = client.peer()
 		{
 			let state = hdr_metadata_rx.borrow_and_update().clone();
 			let key = context.keys_rx.borrow().remote_input_key.clone();
@@ -769,7 +789,7 @@ async fn run_control_loop(
 	// NVST_DISCONN_SERVER_TERMINATED_CLOSED (0x80030023) is recognized by the
 	// client as a graceful shutdown so it does not display an error.
 	let termination_payload = build_termination_payload(0x80030023);
-	if let Some(peer_id) = connected_peer {
+	if let Some(peer_id) = client.peer() {
 		let key = context.keys_rx.borrow().remote_input_key.clone();
 		send_to_peer(
 			&mut host,
@@ -850,5 +870,12 @@ mod tests {
 			panic!("expected an encrypted control message");
 		};
 		assert!(decrypt_control(&message, &[8; 16]).is_err());
+	}
+
+	#[test]
+	fn rejects_an_input_message_too_short_for_its_length() {
+		// Anyone on the LAN can send this unencrypted: it must not panic the control loop.
+		assert!(ControlMessage::from_bytes(&plain(0x0206, &[])).is_err());
+		assert!(ControlMessage::from_bytes(&plain(0x0206, &[0, 0, 0])).is_err());
 	}
 }

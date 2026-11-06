@@ -39,8 +39,9 @@ dasp_sample = "0.11.0"
 dirs = "6.0.0"
 fec-rs = { version = "0.1.0", features = ["parallel"] }
 # The KamilPostrozny fork's `latency` branch: upstream plus the embedder-steered frame clock
-# (`CompositorHandles::frame_clock`) the latency protocol's corrections drive.
-ferriscope = { git = "https://github.com/KamilPostrozny/ferriscope", rev = "c3e1c068101591647a73479ec24b28726c57128a", default-features = false }
+# (`CompositorHandles::frame_clock`) the latency protocol's corrections drive, and ferriscope's
+# WSI layer holding Games in every present mode (ferriscope_swapchain_v1 version 2).
+ferriscope = { git = "https://github.com/KamilPostrozny/ferriscope", rev = "f70857a501b28cc59385cdce99dfaae42e08a4ec", default-features = false }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 gethostname = "1.1.0"
 hex = "0.4.3"

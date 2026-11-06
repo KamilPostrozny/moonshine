@@ -1311,7 +1311,7 @@ checksum = "7a86d2bb0db9647ee5dece2ea54a808c14428db009ad751f95b091598835cd0b"
 [[package]]
 name = "ferriscope"
 version = "0.1.0"
-source = "git+https://github.com/KamilPostrozny/ferriscope?rev=5d44291663947da139fdcc5a499c2a828bbe528c#5d44291663947da139fdcc5a499c2a828bbe528c"
+source = "git+https://github.com/KamilPostrozny/ferriscope?rev=a008a4cd4178f4c8183d9adbf05690c274c817a7#a008a4cd4178f4c8183d9adbf05690c274c817a7"
 dependencies = [
  "bitflags",
  "smithay",
@@ -2755,7 +2755,7 @@ dependencies = [
 [[package]]
 name = "pixelforge"
 version = "0.10.0"
-source = "git+https://github.com/KamilPostrozny/pixelforge?rev=e4e9f26c6d6a87f49180b5b08455b53413113710#e4e9f26c6d6a87f49180b5b08455b53413113710"
+source = "git+https://github.com/KamilPostrozny/pixelforge?rev=9eef6510c19db3d38673365d464ebff330b15256#9eef6510c19db3d38673365d464ebff330b15256"
 dependencies = [
  "ash 0.38.0+1.4.352",
  "futures-channel",
@@ -4036,7 +4036,7 @@ dependencies = [
 [[package]]
 name = "tokio-enet"
 version = "0.1.1"
-source = "git+https://github.com/KamilPostrozny/tokio-enet?rev=a41c32a1a6e902afe0bba92531f7ff49823a2be3#a41c32a1a6e902afe0bba92531f7ff49823a2be3"
+source = "git+https://github.com/KamilPostrozny/tokio-enet?rev=dcdb75b174e082d11d0b9516750bbaa15733801c#dcdb75b174e082d11d0b9516750bbaa15733801c"
 dependencies = [
  "socket2",
  "thiserror 2.0.19",

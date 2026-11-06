@@ -711,6 +711,8 @@ async fn run_control_loop(
 
 		// Report every frame written to the client once it listens, so it can split each frame's
 		// arrival between the host's send and the network. Drained every iteration either way.
+		// The key is cloned for the first report of the drain, not once per report.
+		let mut key = None;
 		loop {
 			let sent = match frame_sent.try_recv() {
 				Ok(sent) => sent,
@@ -721,11 +723,11 @@ async fn run_control_loop(
 				Err(TryRecvError::Empty | TryRecvError::Closed) => break,
 			};
 			if latency_client_ready && let Some(peer_id) = connected_peer {
-				let key = context.keys_rx.borrow().remote_input_key.clone();
+				let key = key.get_or_insert_with(|| context.keys_rx.borrow().remote_input_key.clone());
 				send_latency_message(
 					&mut host,
 					peer_id,
-					&key,
+					key,
 					&mut sequence_number,
 					&frame_sent_message(&sent),
 				);

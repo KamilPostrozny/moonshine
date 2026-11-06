@@ -1314,7 +1314,7 @@ dependencies = [
 [[package]]
 name = "ferriscope"
 version = "0.1.0"
-source = "git+https://github.com/KamilPostrozny/ferriscope?rev=a3e118ee69d584fe90ba35c92de6badea33eadd6#a3e118ee69d584fe90ba35c92de6badea33eadd6"
+source = "git+https://github.com/KamilPostrozny/ferriscope?rev=b3d8b95b82ee716de29f6b3f28c8ed5d94cb3719#b3d8b95b82ee716de29f6b3f28c8ed5d94cb3719"
 dependencies = [
  "bitflags",
  "smithay",
@@ -2758,7 +2758,7 @@ dependencies = [
 [[package]]
 name = "pixelforge"
 version = "0.10.0"
-source = "git+https://github.com/KamilPostrozny/pixelforge?rev=d011835c968c86b15c133b919f3bce11b9631641#d011835c968c86b15c133b919f3bce11b9631641"
+source = "git+https://github.com/KamilPostrozny/pixelforge?rev=9edfeea749368fa607d679e44d007999bf99e1a5#9edfeea749368fa607d679e44d007999bf99e1a5"
 dependencies = [
  "ash 0.38.0+1.4.352",
  "futures-channel",
@@ -3895,7 +3895,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",

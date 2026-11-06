@@ -30,3 +30,32 @@ pub enum ShutdownReason {
 	/// Session manager guard token (trigger_shutdown_token, not a shutdown trigger).
 	SessionManagerShutdown = 5,
 }
+
+impl ShutdownReason {
+	/// The process's exit status: 0 for a requested quit (SIGINT or SIGTERM), so a service
+	/// manager records a stop as a stop, not a failure; the reason's number otherwise.
+	pub fn exit_code(self) -> i32 {
+		match self {
+			Self::AppQuit => 0,
+			other => other as i32,
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::ShutdownReason;
+
+	#[test]
+	fn a_requested_quit_exits_0_and_the_other_reasons_fail() {
+		assert_eq!(ShutdownReason::AppQuit.exit_code(), 0);
+		for reason in [
+			ShutdownReason::HttpShutdown,
+			ShutdownReason::HttpsShutdown,
+			ShutdownReason::RtspShutdown,
+			ShutdownReason::SessionManagerShutdown,
+		] {
+			assert_ne!(reason.exit_code(), 0, "{reason:?}");
+		}
+	}
+}

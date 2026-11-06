@@ -42,6 +42,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A lost control message is resent after about one round trip, not 5 s: tokio-enet is pinned to `KamilPostrozny/tokio-enet` at `9c0107e` (`latency`: 0.1.1 with C ENet's retransmit timeout, `RTT + min(RTT, 4·variance)` times the attempts so far). The disconnect timeout is unchanged.
 - Every queued feedback message (rumble, LED, motion requests, trigger effects) is sent on each control-loop turn, not one per 10 ms.
 - The control loop no longer waits for the gamepad thread: gamepad events go into a queue that never blocks. When it fills (the gamepad thread creating a pad, say), a newer pad state (buttons and sticks, a motion sensor, the battery) replaces the pending ones of its kind for that pad; arrivals and touchpad events keep their order. Before, a full 10-event queue stalled keyboard, mouse, acknowledgements and pings until the pad was created.
+- Apply a reset, keyframe or reference frame invalidation request that arrives while the encoding loop waits for a frame to that frame, not the one after: requests are drained after the wait. Each loss gets one recovery frame: an invalidation that repeats the one still waiting for its recovery frame, or reports only frames older than the last keyframe or recovery frame, is ignored. Before, the client's repeated requests for one loss gave two recovery frames, and past the reference window a burst of IDRs.
+- The keyframe re-encoded while no new frame arrives shows the last frame, not the one before it: pixelforge's `Encoder::repeat` (upstream `3dfc229`, backported to the fork at `3ee4add`) replaces encoding `input_image()`, the next slot.
+- A failed wait for the colour conversion ends the Stream, not only a lost device. Before, the frame went back to the compositor while the GPU might still read it, and the next conversion waited for this one with no timeout.
 
 ## [v0.16.1] - 13-09-2026
 

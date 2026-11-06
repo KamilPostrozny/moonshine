@@ -7,6 +7,7 @@ mod dmabuf;
 mod fence;
 mod filler;
 mod hdr_sei;
+mod recovery;
 
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
@@ -32,6 +33,7 @@ use crate::session::stream::video::{
 
 pub(crate) use dmabuf::KcmpProbe;
 use dmabuf::{CachedImport, DmaBufImporter, DmaBufPlane};
+use recovery::RecoveryRequests;
 
 use pixelforge::vulkan::QueueGlobalPriority;
 use pixelforge::{
@@ -803,9 +805,9 @@ impl VideoPipelineInner {
 		mut encoder: Encoder,
 		packet_tx: mpsc::Sender<PacketBatch>,
 		idr_tx: broadcast::Sender<()>,
-		mut idr_frame_request_rx: broadcast::Receiver<()>,
-		mut invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
-		mut reset_request_rx: broadcast::Receiver<u32>,
+		idr_frame_request_rx: broadcast::Receiver<()>,
+		invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
+		reset_request_rx: broadcast::Receiver<u32>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
@@ -891,22 +893,9 @@ impl VideoPipelineInner {
 		// Whether at least one frame has been encoded (for IDR re-encode).
 		let mut has_encoded = false;
 
-		// Reference frame invalidation maps the client's frame indices (what the
-		// packet consumer stamps into outgoing packets) to pixelforge's display
-		// order (`pts`). The consumer numbers successfully-sent frames from 1
-		// within an epoch, and pixelforge's display order increments once per
-		// submitted frame, so within an epoch:
-		//     display_order = frame_number_base + (client_frame_index - 1).
-		// `submitted_count` is the display order the next submitted frame will
-		// carry; `frame_number_base` is the display order of the first frame of
-		// the current epoch and advances on reset (which restarts the consumer's
-		// numbering). A rare readback drop can skew this by a frame, which at
-		// worst over-invalidates into a (safe) IDR.
-		let mut submitted_count: u64 = 0;
-		let mut frame_number_base: u64 = 0;
-		// Set by a reference frame invalidation and taken by the next submitted
-		// frame, which the client must see as a recovery frame to stop dropping.
-		let mut recovery_pending = false;
+		// Stream resets, keyframe requests and reference frame invalidations, and
+		// the submitted frame each applies to.
+		let mut requests = RecoveryRequests::new(reset_request_rx, idr_frame_request_rx, invalidate_request_rx);
 
 		// Track the last HDR mode state sent to the control stream.
 		let mut last_hdr_state = HdrModeState {
@@ -924,92 +913,28 @@ impl VideoPipelineInner {
 		});
 
 		while !stop_session_manager.is_shutdown_triggered() {
-			let mut pending_idr = false;
-
-			// Drain any pending stream-reset requests (client reconnect/resume).
-			//
-			// Moonlight starts every (re)connected session with its frame counter at 1
-			// and waits for an IDR. Because we keep the pipeline running across a resume,
-			// `frame_number` keeps climbing, so a reconnecting client would see the first
-			// frame's index as a huge jump from its expected 1 — counted as ~100% frame
-			// loss within its sampling window, which immediately trips CONN_STATUS_POOR
-			// ("Your network connection isn't performing well"). Reset the frame and RTP
-			// sequence counters and force an IDR so the resumed client sees a clean stream
-			// starting from frame 1.
-			let mut pending_reset = None;
-			loop {
-				match reset_request_rx.try_recv() {
-					Ok(epoch) => pending_reset = Some(epoch),
-					// The newest epoch is still queued; the next try_recv returns it.
-					Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
-					Err(broadcast::error::TryRecvError::Closed | broadcast::error::TryRecvError::Empty) => break,
-				}
-			}
-			if let Some(epoch) = pending_reset {
-				tracing::info!("Resetting video frame counter for resumed client and forcing IDR.");
-				// Counters live on the consumer task; reset them in order.
+			// Try to receive a frame from compositor (with timeout). Recovery requests
+			// are drained after the wait, so one that arrived during it applies to the
+			// frame it returned.
+			let (received, drained) = requests.wait_for_frame(&mut encoder, || frames.recv_timeout(frame_interval));
+			if let Some(epoch) = drained.reset {
+				// Counters live on the consumer task; reset them before the next frame.
 				let _ = frame_ctx_tx.blocking_send(ConsumerMessage::ResetCounters(epoch));
-				// The next submitted frame becomes the consumer's frame 1 of the
-				// new epoch; anchor the invalidation index mapping to it.
-				frame_number_base = submitted_count;
-				encoder.request_idr();
-				pending_idr = true;
 			}
+			let pending_idr = drained.keyframe;
 
-			// Drain any pending IDR requests.
-			loop {
-				match idr_frame_request_rx.try_recv() {
-					Ok(()) => {
-						tracing::debug!("IDR frame requested");
-						encoder.request_idr();
-						pending_idr = true;
-					},
-					Err(broadcast::error::TryRecvError::Lagged(n)) => {
-						tracing::debug!("IDR frame channel lagged by {n} messages.");
-						encoder.request_idr();
-						pending_idr = true;
-					},
-					Err(broadcast::error::TryRecvError::Closed | broadcast::error::TryRecvError::Empty) => break,
-				}
-			}
-
-			// Drain any pending reference-frame-invalidation requests. Each takes
-			// effect on the next submitted frame, which then predicts from a
-			// surviving reference instead of forcing an IDR (the encoder still
-			// falls back to an IDR when no reference survives).
-			loop {
-				match invalidate_request_rx.try_recv() {
-					Ok((first, _last)) => {
-						let first_display_order = frame_number_base + (first.max(1) as u64 - 1);
-						tracing::debug!(
-							"Reference frame invalidation requested from client frame {first} (display order {first_display_order})"
-						);
-						encoder.invalidate_reference_frames(first_display_order);
-						recovery_pending = true;
-					},
-					Err(broadcast::error::TryRecvError::Lagged(n)) => {
-						// Missed some loss reports; force an IDR to be safe.
-						tracing::debug!("Invalidation channel lagged by {n} messages; forcing IDR.");
-						encoder.request_idr();
-						pending_idr = true;
-					},
-					Err(broadcast::error::TryRecvError::Closed | broadcast::error::TryRecvError::Empty) => break,
-				}
-			}
-
-			// Try to receive a frame from compositor (with timeout).
-			let received_frame = match frames.recv_timeout(frame_interval) {
+			let received_frame = match received {
 				Ok(frame) => Some(frame),
 				Err(ferriscope::RecvTimeoutError::Timeout) => {
 					// No frame received within timeout.
 					// If we have a pending IDR request and have encoded before,
-					// re-encode the encoder's input image (still contains
-					// the last frame's data after color conversion).
+					// re-encode the last frame, which the encoder still holds
+					// converted in one of its input images.
 					if pending_idr && has_encoded {
 						tracing::debug!("Re-encoding last frame for IDR request (no re-import)");
 						// Use current time as created_at for the re-encoded IDR (no actual frame).
 						let now = std::time::Instant::now();
-						match encoder.encode(encoder.input_image()) {
+						match encoder.repeat() {
 							Ok(future) => {
 								let submitted_at = std::time::Instant::now();
 								let inject_hdr = encoder_color_desc.is_some_and(|desc| desc.is_hdr());
@@ -1023,12 +948,11 @@ impl VideoPipelineInner {
 									submitted_at,
 									inject_hdr,
 									hdr_metadata: last_hdr_state.metadata,
-									recovery: std::mem::take(&mut recovery_pending),
+									recovery: requests.submitted(),
 								};
 								// Count this frame in flight; released when the network sender takes
 								// it or the consumer drops it.
 								in_flight.fetch_add(1, Ordering::Relaxed);
-								submitted_count += 1;
 								let _ = frame_ctx_tx.blocking_send(ConsumerMessage::Frame(frame_context, future));
 							},
 							Err(e) => tracing::warn!("Failed to re-encode frame for IDR request: {e}"),
@@ -1282,12 +1206,14 @@ impl VideoPipelineInner {
 				let t4_encoded = std::time::Instant::now();
 
 				// The conversion reads the DMA-BUF until it is done: only then may
-				// dropping the frame return its buffer to the compositor.
+				// dropping the frame return its buffer to the compositor. After a
+				// failed wait the GPU may still be reading it, and the next conversion
+				// would wait for this one without a timeout: end the Stream instead.
 				if let Err(e) = fence::wait_timeline_point(context.device(), converted, fence::FENCE_TIMEOUT) {
-					if e == vk::Result::ERROR_DEVICE_LOST {
-						return Err(format!("GPU color conversion failed: {e}"));
-					}
-					tracing::warn!("Waiting for the color conversion failed: {e}");
+					// Dropping the converter still waits for the conversion, so stop
+					// the session before that.
+					let _ = stop_session_manager.trigger_shutdown(SessionShutdownReason::VideoEncoderStopped);
+					return Err(format!("Waiting for the color conversion failed: {e}"));
 				}
 				drop(frame);
 
@@ -1307,12 +1233,11 @@ impl VideoPipelineInner {
 							submitted_at: t4_encoded,
 							inject_hdr,
 							hdr_metadata: last_hdr_state.metadata,
-							recovery: std::mem::take(&mut recovery_pending),
+							recovery: requests.submitted(),
 						};
 						// Count this frame in flight; released when the network sender takes
 						// it or the consumer drops it.
 						in_flight.fetch_add(1, Ordering::Relaxed);
-						submitted_count += 1;
 						if frame_ctx_tx
 							.blocking_send(ConsumerMessage::Frame(frame_context, future))
 							.is_err()

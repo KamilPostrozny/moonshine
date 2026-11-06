@@ -1314,7 +1314,7 @@ dependencies = [
 [[package]]
 name = "ferriscope"
 version = "0.1.0"
-source = "git+https://github.com/KamilPostrozny/ferriscope?rev=cfedc504c5eaadfd24b0c55036e4431dbe430503#cfedc504c5eaadfd24b0c55036e4431dbe430503"
+source = "git+https://github.com/KamilPostrozny/ferriscope?rev=a3e118ee69d584fe90ba35c92de6badea33eadd6#a3e118ee69d584fe90ba35c92de6badea33eadd6"
 dependencies = [
  "bitflags",
  "smithay",
@@ -2758,7 +2758,7 @@ dependencies = [
 [[package]]
 name = "pixelforge"
 version = "0.10.0"
-source = "git+https://github.com/KamilPostrozny/pixelforge?rev=3ee4addaf73b1e8148b3fbbfa8e23d8b3f18fa5a#3ee4addaf73b1e8148b3fbbfa8e23d8b3f18fa5a"
+source = "git+https://github.com/KamilPostrozny/pixelforge?rev=06942afa0d5be0c25a5683e2dd2eb5f2c46ad257#06942afa0d5be0c25a5683e2dd2eb5f2c46ad257"
 dependencies = [
  "ash 0.38.0+1.4.352",
  "futures-channel",

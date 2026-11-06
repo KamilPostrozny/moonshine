@@ -41,8 +41,8 @@ fec-rs = { version = "0.1.0", features = ["parallel"] }
 # The KamilPostrozny fork's `latency` branch: upstream plus the embedder-steered frame clock
 # (`CompositorHandles::frame_clock`) the latency protocol's corrections drive, and ferriscope's
 # WSI layer holding Games in every present mode (ferriscope_swapchain_v1 version 2), installed
-# for x86_64 and i686.
-ferriscope = { git = "https://github.com/KamilPostrozny/ferriscope", rev = "cfedc504c5eaadfd24b0c55036e4431dbe430503", default-features = false }
+# for x86_64 and i686, and a session teardown that leaves no Xwayland, socket or lock behind.
+ferriscope = { git = "https://github.com/KamilPostrozny/ferriscope", rev = "a3e118ee69d584fe90ba35c92de6badea33eadd6", default-features = false }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 gethostname = "1.1.0"
 hex = "0.4.3"
@@ -65,8 +65,9 @@ pkcs8 = "0.11.0"
 # v0.10.0 plus upstream's reference-window fix (`f046afe`, only on upstream main, which
 # changes the encode API): RADV predicts HEVC/AV1 frames from one reference, and v0.10.0
 # sized the whole window by that, so every reference frame invalidation became an IDR.
-# Also upstream's `Encoder::repeat` (`3dfc229`), backported, for the idle keyframe.
-pixelforge = { git = "https://github.com/KamilPostrozny/pixelforge", rev = "3ee4addaf73b1e8148b3fbbfa8e23d8b3f18fa5a", features = ["dmabuf"] }
+# Also the fork's global queue priority (`VideoContextBuilder::highest_queue_priority`), and
+# upstream's `Encoder::repeat` (`3dfc229`), backported, for the idle keyframe.
+pixelforge = { git = "https://github.com/KamilPostrozny/pixelforge", rev = "06942afa0d5be0c25a5683e2dd2eb5f2c46ad257", features = ["dmabuf"] }
 pulseaudio = "0.3.1"
 rcgen = "0.14.8"
 rsa = "0.9.10"

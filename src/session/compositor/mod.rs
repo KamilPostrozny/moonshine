@@ -230,7 +230,10 @@ impl Compositor {
 		)
 	}
 
-	pub fn launch(self) -> Result<LaunchedCompositor, ()> {
+	/// `game_stopped` resolves (its sender is dropped) once the Game's unit has stopped: after the
+	/// session stops, ferriscope keeps running until then, so a Game (Steam's own shutdown) keeps
+	/// its display while it exits.
+	pub fn launch(self, game_stopped: tokio::sync::oneshot::Receiver<()>) -> Result<LaunchedCompositor, ()> {
 		let Self {
 			config,
 			context,
@@ -310,6 +313,7 @@ impl Compositor {
 			})?;
 		tokio::spawn(async move {
 			session_stop.wait_shutdown_triggered().await;
+			let _ = game_stopped.await;
 			stop_handle.stop();
 		});
 

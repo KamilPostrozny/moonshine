@@ -21,6 +21,7 @@ use moonshine::session::stream::video::VideoDynamicRange;
 use moonshine::session::stream::video::VideoFormat;
 use moonshine::session::stream::video::VideoStreamConfig;
 use moonshine::session::stream::video::VideoStreamContext;
+use moonshine_tools::teardown::Snapshot;
 use tokio::signal;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -65,6 +66,13 @@ struct Args {
 	/// Print per-frame stats to stderr instead of periodic summary.
 	#[arg(long)]
 	verbose: bool,
+
+	/// Run N sessions back to back, then check that ending them released
+	/// everything they started: no Xwayland child, display socket or lock,
+	/// real-time thread, or VRAM above the level before the first session.
+	/// Fails if anything remains.
+	#[arg(long, value_name = "N", conflicts_with = "matrix", value_parser = clap::value_parser!(u32).range(1..))]
+	sessions: Option<u32>,
 }
 
 fn parse_resolution(s: &str) -> Result<(u32, u32), String> {
@@ -440,6 +448,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 	if args.matrix {
 		run_matrix(&args).await
+	} else if let Some(sessions) = args.sessions {
+		run_sessions(&args, sessions).await
 	} else {
 		run_single(&args).await
 	}
@@ -448,6 +458,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn run_single(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 	run_benchmark(args, "", &args.resolution, args.fps, &args.codec, args.duration).await?;
 	Ok(())
+}
+
+/// `--sessions`: run `count` sessions back to back, then check what they left
+/// behind in this process against what it held before the first.
+async fn run_sessions(args: &Args, count: u32) -> Result<(), Box<dyn std::error::Error>> {
+	/// How long the process gets to release what the last session held once
+	/// `stop_session` has returned.
+	const SETTLE: Duration = Duration::from_secs(5);
+	/// VRAM growth allowed over the baseline.
+	const VRAM_SLACK: u64 = 0;
+
+	let duration = if args.duration == 0 {
+		tracing::info!("The teardown check needs a finite duration; defaulting to 5s. Pass --duration to override.");
+		5
+	} else {
+		args.duration
+	};
+
+	let baseline = Snapshot::take();
+	tracing::info!(
+		"Teardown check: {count} sessions; before the first, {} real-time threads, VRAM {} KiB",
+		baseline.realtime_threads.len(),
+		baseline.vram_bytes / 1024
+	);
+	for session in 1..=count {
+		tracing::info!("Teardown check: session {session} of {count}");
+		let report = run_benchmark(args, "", &args.resolution, args.fps, &args.codec, duration).await?;
+		if report.interrupted {
+			return Err(boxed_error("Teardown check interrupted"));
+		}
+		tracing::info!(
+			"Teardown check: after session {session}, VRAM {} KiB",
+			Snapshot::take().vram_bytes / 1024
+		);
+	}
+
+	let deadline = Instant::now() + SETTLE;
+	let leftovers = loop {
+		let leftovers = Snapshot::take().leftovers_since(&baseline, VRAM_SLACK);
+		if leftovers.is_empty() || Instant::now() >= deadline {
+			break leftovers;
+		}
+		tokio::time::sleep(Duration::from_millis(100)).await;
+	};
+	if leftovers.is_empty() {
+		tracing::info!("Teardown check passed: {count} sessions left nothing behind.");
+		return Ok(());
+	}
+	for leftover in &leftovers {
+		tracing::error!("Left behind by {count} sessions: {leftover}");
+	}
+	Err(boxed_error(format!(
+		"Teardown check failed: {} leftover(s) after {count} sessions",
+		leftovers.len()
+	)))
 }
 
 async fn run_matrix(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
@@ -571,10 +636,16 @@ async fn run_benchmark(
 	tracing::info!("  duration:   {}s", duration_str);
 	tracing::info!("  warmup:     {}s", args.warmup);
 
+	// A free video port rather than Moonshine's 47998, so a bench beside a
+	// running Moonshine never takes the port a Stream needs.
+	let video_port = UdpSocket::bind("127.0.0.1:0")?.local_addr()?.port();
 	let shutdown = ShutdownManager::<ShutdownReason>::new();
 	let session_manager = SessionManager::new(
 		CompositorConfig::default(),
-		VideoStreamConfig::default(),
+		VideoStreamConfig {
+			port: video_port,
+			..VideoStreamConfig::default()
+		},
 		AudioStreamConfig { port: 0 },
 		ControlStreamConfig {
 			port: 0,
@@ -667,7 +738,7 @@ async fn run_benchmark(
 	// Send PING to the video socket so the packet handler learns the client
 	// address and actually transmits encoded frames over UDP (otherwise all
 	// packets are silently dropped waiting for a Moonlight client to connect).
-	let ping_addr: std::net::SocketAddr = "127.0.0.1:47998".parse().unwrap();
+	let ping_addr = std::net::SocketAddr::from(([127, 0, 0, 1], video_port));
 	if let Ok(ping_sock) = UdpSocket::bind("127.0.0.1:0") {
 		let _ = ping_sock.send_to(b"PING", ping_addr);
 		tracing::debug!("Sent PING to video socket at {ping_addr}");

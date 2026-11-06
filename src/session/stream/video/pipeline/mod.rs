@@ -322,15 +322,16 @@ impl PacketBatch {
 	/// the consumer would produce it.
 	#[cfg(test)]
 	pub(super) fn holding_slot(in_flight: &Arc<AtomicUsize>) -> Self {
-		Self::frame(0, ShardBatch::empty(), in_flight)
+		Self::frame(0, 0, ShardBatch::empty(), in_flight)
 	}
 
-	/// Frame `frame_number`'s shards, holding a new in-flight slot.
+	/// Frame `frame_number`'s shards, packetized in reset epoch `epoch`, holding a new in-flight
+	/// slot.
 	#[cfg(test)]
-	pub(super) fn frame(frame_number: u32, shards: ShardBatch, in_flight: &Arc<AtomicUsize>) -> Self {
+	pub(super) fn frame(epoch: u32, frame_number: u32, shards: ShardBatch, in_flight: &Arc<AtomicUsize>) -> Self {
 		in_flight.fetch_add(1, Ordering::Relaxed);
 		Self {
-			epoch: 0,
+			epoch,
 			frame_number,
 			shards,
 			in_flight: InFlightGuard(in_flight.clone()),

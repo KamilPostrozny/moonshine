@@ -682,13 +682,14 @@ mod tests {
 		let (frame_sent_tx, mut frame_sent) = broadcast::channel(FRAME_SENT_CAPACITY);
 		let start = StartSignal::new();
 		let stop = ShutdownManager::new();
+		let resume_pending = Arc::new(AtomicBool::new(false));
 		spawn_handle_video_packets(
 			packet_rx,
 			socket,
 			start.waiter(),
 			reset_tx,
 			frame_sent_tx,
-			Arc::new(AtomicBool::new(false)),
+			resume_pending.clone(),
 			stop.clone(),
 		);
 		start.trigger();
@@ -696,16 +697,29 @@ mod tests {
 		let shards = || shard_batch::ShardBuf::new(2, 64, 0).into_batch();
 
 		// Before the client's PING there is nowhere to send a frame: it isn't reported.
-		packet_tx.try_send(PacketBatch::frame(1, shards(), &in_flight)).unwrap();
+		packet_tx
+			.try_send(PacketBatch::frame(0, 1, shards(), &in_flight))
+			.unwrap();
 		while in_flight.load(Ordering::Relaxed) > 0 {
 			tokio::task::yield_now().await;
 		}
 		assert!(frame_sent.try_recv().is_err());
 
+		// A pending resume makes the sender's handling of the PING observable: it clears the flag
+		// and starts reset epoch 1.
+		resume_pending.store(true, Ordering::Relaxed);
 		client.send_to(b"PING", host).await.unwrap();
-		tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+		tokio::time::timeout(std::time::Duration::from_secs(1), async {
+			while resume_pending.load(Ordering::Relaxed) {
+				tokio::task::yield_now().await;
+			}
+		})
+		.await
+		.expect("the sender never handled the client's PING");
 		let before = Instant::now();
-		packet_tx.try_send(PacketBatch::frame(2, shards(), &in_flight)).unwrap();
+		packet_tx
+			.try_send(PacketBatch::frame(1, 2, shards(), &in_flight))
+			.unwrap();
 		let sent = tokio::time::timeout(std::time::Duration::from_secs(1), frame_sent.recv())
 			.await
 			.expect("the sent frame was never reported")

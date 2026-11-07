@@ -1,5 +1,5 @@
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -345,12 +345,30 @@ fn make_envs(context: &ApplicationContext, config_env: &BTreeMap<String, String>
 		envs.push(format!("{key}={value}"));
 	}
 
-	// The application's own variables come last, so systemd lets them win.
+	// The application's own variables come last, so they win.
 	for (key, value) in config_env {
 		envs.push(format!("{key}={value}"));
 	}
 
-	Ok(envs)
+	Ok(last_assignments(envs))
+}
+
+/// `envs` with only the last assignment of each name, in order: systemd's StartTransientUnit
+/// rejects an `Environment=` block that assigns a name twice ("Invalid environment block"), so a
+/// variable Moonshine forces and the application sets again would stop the Game from starting.
+fn last_assignments(mut envs: Vec<String>) -> Vec<String> {
+	let name = |assignment: &str| {
+		assignment
+			.split_once('=')
+			.map_or(assignment, |(key, _)| key)
+			.to_string()
+	};
+	let mut later = HashSet::new();
+	let mut keep: Vec<bool> = envs.iter().rev().map(|entry| later.insert(name(entry))).collect();
+	keep.reverse();
+	let mut keep = keep.into_iter();
+	envs.retain(|_| keep.next().unwrap_or(true));
+	envs
 }
 
 /// Whether a Game gets forced sync: not when its environment opts out of ferriscope-wsi's hold,
@@ -1427,5 +1445,37 @@ mod tests {
 		);
 
 		assert_eq!(env.get("XDG_CURRENT_DESKTOP").map(String::as_str), Some("gamescope"));
+	}
+
+	#[test]
+	fn a_variable_set_twice_reaches_systemd_once_with_the_games_value() {
+		// systemd's StartTransientUnit rejects an `Environment=` block that assigns a name twice
+		// ("Invalid environment block"), so the Game never starts. Moonshine forces `vblank_mode`
+		// and `__GL_SYNC_TO_VBLANK`, the compositor and the client's mode set theirs, and the
+		// Game's env may set any of them again.
+		let mut context = test_context();
+		context.compositor_env = vec![("XDG_CURRENT_DESKTOP".to_string(), "gamescope".to_string())];
+		context.extra_env = HashMap::from([("XDG_CURRENT_DESKTOP".to_string(), "client".to_string())]);
+		let env = BTreeMap::from([
+			("vblank_mode".to_string(), "0".to_string()),
+			("XDG_CURRENT_DESKTOP".to_string(), "game".to_string()),
+		]);
+		let envs = make_envs(&context, &env).unwrap();
+		let options = launch_options(&envs, false);
+		let properties = unit_properties(&options, &commands(None)).unwrap();
+
+		let block: Vec<String> = properties
+			.iter()
+			.filter(|(key, _)| key == "Environment")
+			.flat_map(|(_, value)| <Vec<String>>::try_from(value.try_clone().unwrap()).unwrap())
+			.collect();
+		let mut keys: Vec<&str> = block.iter().map(|entry| entry.split_once('=').unwrap().0).collect();
+		keys.sort_unstable();
+		let mut duplicates = keys.clone();
+		duplicates.dedup();
+		assert_eq!(keys, duplicates, "duplicate keys in the Environment block {block:?}");
+		assert_eq!(effective(&block, "vblank_mode"), Some("0"));
+		assert_eq!(effective(&block, "__GL_SYNC_TO_VBLANK"), Some("1"));
+		assert_eq!(effective(&block, "XDG_CURRENT_DESKTOP"), Some("game"));
 	}
 }

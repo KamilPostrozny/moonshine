@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A Game whose application `env` sets a variable Moonshine also sets (`vblank_mode=0` against the forced `vblank_mode=3`, `__GL_SYNC_TO_VBLANK`, the compositor's or the client's variables) starts again: the Game unit's `Environment=` carries each name once, with its last value (the application's own wins), since systemd's `StartTransientUnit` rejects a duplicate name ("Invalid environment block") and the Game never started.
 - Recover a lost frame by reference frame invalidation instead of an IDR. A client that sends `maxNumReferenceFrames=0` ("the codec's maximum", every RFI-capable Moonlight) gets pixelforge's default window of 4 references instead of 1. Pin pixelforge to `KamilPostrozny/pixelforge` at `4262658` (v0.10.0 plus upstream `f046afe`), which keeps that window when the device predicts each frame from one reference (RADV HEVC and AV1).
 - Mark the first frame after a reference frame invalidation as a recovery frame (frame header type 5, as Sunshine does). Moonlight drops every frame after a loss until a key or recovery frame arrives, so without the mark each invalidation still ended in a one-second stall and the IDR Moonlight requests after it.
 - A reconnecting client's first steerable report no longer acknowledges the previous client's last correction, and corrections the previous client left queued are dropped (ferriscope `FrameClockSender::new_consumer`).

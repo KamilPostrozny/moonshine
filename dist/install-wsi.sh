@@ -52,4 +52,10 @@ if [ -z "$ferriscope" ]; then
 	ferriscope=$(dirname "$manifest")
 fi
 
-CARGO_TARGET_DIR=$root/target/ferriscope-wsi "$ferriscope/tools/install-wsi.sh" --prefix "$prefix"
+# One build directory per ferriscope checkout. cargo treats a checkout under
+# ~/.cargo/git as a non-local package and never compares its sources' times, so
+# a shared directory kept answering "Fresh" with the layer of the first
+# revision it built, and every later revision installed that old layer.
+checkout=$(realpath "$ferriscope")
+CARGO_TARGET_DIR=$root/target/ferriscope-wsi/$(printf '%s' "$checkout" | sha256sum | cut -c1-16) \
+	"$ferriscope/tools/install-wsi.sh" --prefix "$prefix"

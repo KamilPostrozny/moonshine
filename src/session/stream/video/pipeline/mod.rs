@@ -627,7 +627,6 @@ impl VideoPipeline {
 		std::thread::Builder::new()
 			.name("video-pipeline".to_string())
 			.spawn(move || {
-				let _ = crate::session::realtime::register_current("video-pipeline");
 				inner.run(
 					send_runtime,
 					frames,
@@ -821,6 +820,10 @@ impl VideoPipelineInner {
 
 		let mut packetizer = Packetizer::new(ctx.encrypt_video, self.keys_rx.clone());
 		packetizer.warm_up(self.config.fec_percentage, ctx.minimum_fec_packets);
+		// Only now on SCHED_RR: creating the encoder (in `run`) and warming the FEC cache run for
+		// hundreds of milliseconds without blocking, which the shared unit's real-time watchdog
+		// (LimitRTTIME=200ms) answers with SIGXCPU. From here on the thread blocks every frame.
+		let _ = crate::session::realtime::register_current("video-pipeline");
 
 		// The encoder is asynchronous: each `encode()` returns a future that
 		// resolves with that frame's packet once the GPU finishes. We hand each
